@@ -1,6 +1,13 @@
+import argparse
+import glob
+import json
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
- 
+import torch.nn.functional as F
+
 
 
 
@@ -489,4 +496,227 @@ class UNET(nn.Module):
         x = self.output_block(x)
         #print("after output_block shape: ", x.shape)
         return(x)
+
+
+
+# =====================================================================
+# Training: RCM predictors (ALADIN63) -> 3 km target
+# Default: predictors already upscaled onto the 3 km grid (same grid, scale_factor = 1,
+# no upsampling in the OutputBlock). For raw ~12 km predictors use --scale-factor 4
+# (double_resolution_times = 2).
+# =====================================================================
+
+DATA_DIR = Path("/mnt/nas/Data")
+
+# Predictors (upscaled to 3 km) and target (3 km). Adjust the patterns to the NAS layout.
+LR_VARIABLES = ["tasAdjust", "hussAdjust", "hursAdjust", "prAdjust",
+                "rsdsAdjust", "sfcWindAdjust", "tasmaxAdjust", "tasminAdjust"]
+LR_PATTERN = str(DATA_DIR / "ALADIN63_upscaled_3km" / "daily" / "{var}" / "*.nc")   # placeholder: set to the upscaled files
+HR_TARGET = "tas"
+HR_PATTERN = str(DATA_DIR / "3km" / "{var}" / "*.nc")
+
+OROG_PATH = None          # optional static 3 km orography file, added as an extra input channel
+SCALE_FACTOR = 1          # 1 = same grid (upscaled predictors), 4 = raw 12 km -> 3 km
+MODELS_DIR = Path("models") / "unet_3km"
+
+
+def load_variable(pattern, var):
+    import xarray as xr
+
+    files = sorted(glob.glob(pattern.format(var = var)))
+    if not files:
+        raise FileNotFoundError(f"No files for '{var}' matching {pattern.format(var = var)}")
+
+    ds = xr.open_mfdataset(files, combine = "by_coords")
+    da = ds[var] if var in ds.data_vars else ds[list(ds.data_vars)[0]]
+    da = da.squeeze(drop = True)
+    da["time"] = da["time"].dt.floor("D")    # daily data: align on dates only
+    return da.transpose("time", ...)         # (time, y, x)
+
+
+def load_orography(path):
+    import xarray as xr
+
+    ds = xr.open_dataset(path)
+    da = ds["orog"] if "orog" in ds.data_vars else ds[list(ds.data_vars)[0]]
+    da = da.squeeze(drop = True)
+    if "time" in da.dims:
+        da = da.isel(time = 0, drop = True)
+    return da                                # (y, x)
+
+
+def check_same_grid(reference, others):
+    # Same-grid training only makes sense if every field sits on exactly the target pixels
+    spatial_dims = [d for d in reference.dims if d != "time"]
+    for da in others:
+        da_dims = [d for d in da.dims if d != "time"]
+        if da.shape[-2:] != reference.shape[-2:]:
+            raise ValueError(f"'{da.name}' grid {da.shape[-2:]} != target grid {reference.shape[-2:]}")
+        for ref_name in list(spatial_dims) + ["lat", "lon"]:
+            if ref_name in reference.coords and ref_name in da.coords:
+                if not np.allclose(reference[ref_name].values, da[ref_name].values, atol = 1e-4, equal_nan = True):
+                    raise ValueError(f"'{da.name}' coordinate '{ref_name}' differs from the target grid")
+        if da_dims != spatial_dims:
+            print(f"Warning: '{da.name}' dims {da_dims} differ from target dims {spatial_dims}, shapes match")
+
+
+def load_data(lr_pattern, lr_variables, hr_pattern, hr_target, same_grid = True, orog_path = None):
+    import xarray as xr
+
+    lr = [load_variable(lr_pattern, v) for v in lr_variables]
+    hr = load_variable(hr_pattern, hr_target)
+    *lr, hr = xr.align(*lr, hr, join = "inner", exclude = [d for d in hr.dims if d != "time"])
+
+    static = [load_orography(orog_path)] if orog_path else []
+    if same_grid:
+        check_same_grid(hr, lr + static)
+    elif static and static[0].shape != lr[0].shape[-2:]:
+        raise ValueError(f"Orography grid {static[0].shape} != predictor grid {lr[0].shape[-2:]}")
+
+    channels = [da.values for da in lr] + [np.broadcast_to(da.values, lr[0].shape) for da in static]
+    X = np.stack(channels, axis = 1).astype(np.float32)                  # (T, C, h, w)
+    Y = hr.values[:, None].astype(np.float32)                            # (T, 1, H, W)
+    print(f"Common days: {X.shape[0]} | LR {X.shape[2:]} -> HR {Y.shape[2:]}")
+    return X, Y
+
+
+def chronological_splits(n, val_frac = 0.15, test_frac = 0.15):
+    n_test, n_val = int(n * test_frac), int(n * val_frac)
+    idx = np.arange(n)
+    return idx[:n - n_val - n_test], idx[n - n_val - n_test:n - n_test], idx[n - n_test:]
+
+
+def normalization_stats(X, Y):
+    return {"x_mean": np.nanmean(X, axis = (0, 2, 3)).tolist(), "x_std": np.nanstd(X, axis = (0, 2, 3)).tolist(),
+            "y_mean": float(np.nanmean(Y)), "y_std": float(np.nanstd(Y))}
+
+
+def normalize(X, Y, stats):
+    x_mean = np.array(stats["x_mean"], dtype = np.float32)[None, :, None, None]
+    x_std = np.array(stats["x_std"], dtype = np.float32)[None, :, None, None] + 1e-8
+    X = np.nan_to_num((X - x_mean) / x_std)                  # NaN (e.g. sea) -> 0 in the inputs
+    Y = (Y - stats["y_mean"]) / (stats["y_std"] + 1e-8)       # NaN kept in target, masked in the loss
+    return X, Y
+
+
+def pad_to_multiple(x, multiple):
+    # The contractive path halves H, W number_of_blocks times: pad so they stay even
+    h, w = x.shape[-2:]
+    pad_h, pad_w = (-h) % multiple, (-w) % multiple
+    return F.pad(x, (0, pad_w, 0, pad_h), mode = "replicate"), (h, w)
+
+
+class DownscalingModel(nn.Module):
+    # Wraps the UNET: pads the input, crops the (x scale_factor) output and resizes it onto the exact 3 km grid.
+    # With scale_factor = 1 (upscaled predictors) the UNET keeps the input resolution.
+    def __init__(self, in_channels, lr_shape, hr_shape, number_of_blocks = 4, scale_factor = SCALE_FACTOR, **unet_kwargs) -> None:
+        super().__init__()
+
+        self.multiple = 2 ** number_of_blocks
+        self.scale_factor = scale_factor
+        self.hr_shape = tuple(hr_shape)
+        padded = [s + (-s) % self.multiple for s in lr_shape]
+
+        self.unet = UNET(input_shape_2D = (1, in_channels, *padded), output_channels = 1,
+                         number_of_blocks = number_of_blocks,
+                         double_resolution_times = int(np.log2(scale_factor)),
+                         **unet_kwargs)
+
+    def forward(self, x):
+        x, (h, w) = pad_to_multiple(x, self.multiple)
+        x = self.unet(x)[..., :h * self.scale_factor, :w * self.scale_factor]
+        if x.shape[-2:] != self.hr_shape:
+            x = F.interpolate(x, size = self.hr_shape, mode = "bilinear", align_corners = False)
+        return x
+
+
+def masked_mse(y_pred, y_true):
+    mask = ~torch.isnan(y_true)
+    return ((y_pred[mask] - y_true[mask]) ** 2).mean()
+
+
+def run_epoch(model, loader, device, optimizer = None):
+    model.train(optimizer is not None)
+    total, n = 0.0, 0
+    with torch.set_grad_enabled(optimizer is not None):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            loss = masked_mse(model(x), y)
+            if optimizer is not None:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            total += loss.item() * x.shape[0]
+            n += x.shape[0]
+    return total / n
+
+
+def train(args):
+    from torch.utils.data import DataLoader, TensorDataset
+
+    MODELS_DIR.mkdir(parents = True, exist_ok = True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    X, Y = load_data(args.lr_pattern, args.lr_variables, args.hr_pattern, args.hr_target,
+                     same_grid = args.scale_factor == 1, orog_path = args.orog_path)
+    idx_train, idx_val, idx_test = chronological_splits(X.shape[0])
+    np.savez(MODELS_DIR / "splits.npz", train = idx_train, val = idx_val, test = idx_test)
+
+    stats = normalization_stats(X[idx_train], Y[idx_train])
+    stats.update({"lr_variables": args.lr_variables, "hr_target": args.hr_target,
+                  "orog_path": args.orog_path, "scale_factor": args.scale_factor})
+    json.dump(stats, open(MODELS_DIR / "normalization_stats.json", "w"), indent = 2)
+    X, Y = normalize(X, Y, stats)
+
+    def loader(idx, shuffle):
+        return DataLoader(TensorDataset(torch.from_numpy(X[idx]), torch.from_numpy(Y[idx])),
+                          batch_size = args.batch_size, shuffle = shuffle)
+    train_loader, val_loader = loader(idx_train, True), loader(idx_val, False)
+
+    model = DownscalingModel(in_channels = X.shape[1], lr_shape = X.shape[2:], hr_shape = Y.shape[2:],
+                             scale_factor = args.scale_factor,
+                             input_number_kernels = args.base_channels,
+                             dropout_rate_2D = args.dropout).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor = 0.5, patience = 7)
+    print(f"Device: {device} | parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    best_val, epochs_without_improvement = float("inf"), 0
+    for epoch in range(1, args.epochs + 1):
+        train_loss = run_epoch(model, train_loader, device, optimizer)
+        val_loss = run_epoch(model, val_loader, device)
+        scheduler.step(val_loss)
+        print(f"Epoch {epoch:3d} | train MSE {train_loss:.4f} | val MSE {val_loss:.4f}")
+
+        if val_loss < best_val:
+            best_val, epochs_without_improvement = val_loss, 0
+            torch.save(model.state_dict(), MODELS_DIR / "best.pt")
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= args.patience:
+                print("Early stopping")
+                break
+
+    model.load_state_dict(torch.load(MODELS_DIR / "best.pt", map_location = device))
+    test_loss = run_epoch(model, loader(idx_test, False), device)
+    rmse = np.sqrt(test_loss) * stats["y_std"]
+    print(f"Best val MSE {best_val:.4f} | test RMSE {rmse:.4f} (target units) | weights: {MODELS_DIR / 'best.pt'}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description = "Train the UNET to downscale to 3 km resolution")
+    parser.add_argument("--lr-pattern", default = LR_PATTERN, help = "glob of (upscaled) predictor files, '{var}' = variable name")
+    parser.add_argument("--lr-variables", nargs = "+", default = LR_VARIABLES)
+    parser.add_argument("--hr-pattern", default = HR_PATTERN, help = "glob of 3 km target files, '{var}' = variable name")
+    parser.add_argument("--hr-target", default = HR_TARGET)
+    parser.add_argument("--orog-path", default = OROG_PATH, help = "optional orography file, added as an input channel")
+    parser.add_argument("--scale-factor", type = int, default = SCALE_FACTOR, choices = [1, 2, 4, 8],
+                        help = "1 = predictors already on the 3 km grid, 4 = raw 12 km predictors")
+    parser.add_argument("--base-channels", type = int, default = 32)
+    parser.add_argument("--dropout", type = float, default = 0.)
+    parser.add_argument("--batch-size", type = int, default = 16)
+    parser.add_argument("--lr", type = float, default = 1e-4)
+    parser.add_argument("--epochs", type = int, default = 75)
+    parser.add_argument("--patience", type = int, default = 15)
+    train(parser.parse_args())
 
