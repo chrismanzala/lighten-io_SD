@@ -1,6 +1,73 @@
+"""
+UNET.py - U-Net statistical downscaling (PyTorch)
+=================================================
+
+Purpose
+-------
+Downscale daily climate variables over La Reunion from ~150 km (GCM-like) resolution
+to 3 km, using the bias-corrected ALADIN data (ALADIN_CORRIGE) and a DEM.
+
+Inputs / output
+---------------
+  1D input : predictors upscaled to ~COARSE_KM (block mean, sea ignored) and flattened
+             to a vector (T, V * gh * gw). Domain < 150 km  ->  one value per variable.
+             Goes through InputBlock1D (dense stack) and is injected at the bottleneck.
+  2D input : static DEM (GEBCO, averaged onto the 3 km grid, sea = 0 m), one channel.
+             Goes through InputBlock2D and the skip connections.
+  output   : target variable on the 3 km grid, (N, 1, H, W).
+
+Architecture (default: 32 base channels, 4 blocks)
+--------------------------------------------------
+  DEM -> InputBlock2D (32) -> 4 x ContractiveBlock (MaxPool + 2 x Conv3x3-BN-ReLU)
+                                 channels 64 / 128 / 256 / 256, resolution H/2 ... H/16
+  vector -> InputBlock1D -> BottleNeckBlock (conv to 1x1, concat vector, ConvTranspose back)
+  -> 4 x ExpansiveBlock (bilinear Upsample x2 -> Conv3x3 -> concat skip -> 2 x Conv3x3)
+  -> OutputBlock (1x1 Conv; optional extra resolution doublings, 0 here)
+
+  Building blocks (bottom -> top):
+    DenseLayer, ConvolutionalLayer, ConvolutionalBlock, ContractiveBlock,
+    DoubleResolutionLayer, ConcatChannelsLayer, ExpansiveBlock, BottleNeckBlock,
+    InputBlock2D, InputBlock1D, OutputBlock, UNET.
+  UNET.forward(x_2D, x_1D). Without input_shape_1D it is a plain U-Net.
+  H and W must be multiples of 2**number_of_blocks: DownscalingModel pads the static
+  DEM and crops the output back to the 3 km grid.
+
+Pipeline
+--------
+  load_data -> coarsen_to_vector -> normalization (train-split stats) -> DownscalingModel
+  (DEM stored as a buffer, same for every day) -> masked MSE on land pixels.
+
+Data (under DATA_DIR = /mnt/nas/Data)
+-------------------------------------
+  METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE/{historical,ssp370}/day/{var}/*.nc
+  1D_data/gebco_2025_*.nc   (DEM, variable "elevation")
+  Predictors: tasmax, tasmin, hursmax, hursmin, prtot, rsds, sfcWind (the *Adjust variables);
+  default target: tasmaxAdjust. historical covers 1981-2014, ssp370 covers 2015-2100.
+
+Usage
+-----
+  python UNET.py                          # train on historical (chronological 70/15/15 split)
+  python UNET.py --mode predict           # apply the saved model to ssp370
+  python UNET.py --target tasminAdjust --epochs 75 --base-channels 32 --coarse-km 150
+
+Outputs (models/unet_3km/)
+--------------------------
+  best.pt, normalization_stats.json, splits.npz, land_mask.npy,
+  {target}_{scenario}_3km_pred.nc  (from --mode predict)
+
+Known limitations
+-----------------
+  - ContractiveBlock loop in UNET.__init__: block 0 is built then overwritten by the
+    `else` branch, so it does not use replicate padding.
+  - DoubleResolutionLayer ignores `output_padding`; ExpansiveBlock does not pass
+    `dropout_rate` to it.
+  - ssp370 goes beyond the 1981-2014 training range: check extrapolation.
+"""
+
 import argparse
 import glob
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +86,7 @@ class DenseLayer(nn.Sequential): # maybe put activation function as ReLu
             nn.Linear(in_features = in_features, out_features = out_features),
             nn.BatchNorm1d(num_features = out_features),
             nn.ReLU(),
-            nn.Dropout1d(p = dropout_rate)
+            nn.Dropout(p = dropout_rate)     # (N, F) input: Dropout1d would treat it as unbatched (C, L)
             )
 
 
@@ -499,85 +566,91 @@ class UNET(nn.Module):
 
 
 
+
+
 # =====================================================================
-# Training: RCM predictors (ALADIN63) -> 3 km target
-# Default: predictors already upscaled onto the 3 km grid (same grid, scale_factor = 1,
-# no upsampling in the OutputBlock). For raw ~12 km predictors use --scale-factor 4
-# (double_resolution_times = 2).
+# Training: coarse (~150 km, GCM-like) predictors + DEM  ->  3 km target
+#   2D input : static DEM on the 3 km grid  (InputBlock2D + skip connections)
+#   1D input : predictors upscaled to ~COARSE_KM, flattened to a vector (InputBlock1D -> bottleneck)
+#   output   : target variable on the 3 km grid (ALADIN_CORRIGE)
+# Train on `historical`, apply to `ssp370` with --mode predict.
 # =====================================================================
 
 DATA_DIR = Path("/mnt/nas/Data")
-
-# Predictors (upscaled to 3 km) and target (3 km). Adjust the patterns to the NAS layout.
-LR_VARIABLES = ["tasAdjust", "hussAdjust", "hursAdjust", "prAdjust",
-                "rsdsAdjust", "sfcWindAdjust", "tasmaxAdjust", "tasminAdjust"]
-LR_PATTERN = str(DATA_DIR / "ALADIN63_upscaled_3km" / "daily" / "{var}" / "*.nc")   # placeholder: set to the upscaled files
-HR_TARGET = "tas"
-HR_PATTERN = str(DATA_DIR / "3km" / "{var}" / "*.nc")
-
-OROG_PATH = None          # optional static 3 km orography file, added as an extra input channel
-SCALE_FACTOR = 1          # 1 = same grid (upscaled predictors), 4 = raw 12 km -> 3 km
+ALADIN_DIR = DATA_DIR / "METEO_FRANCE" / "DONNEES_SIMULATIONS" / "ALADIN" / "ALADIN_CORRIGE"   # {historical,ssp370}/day/{var}/*.nc
+PREDICTORS = ["tasmaxAdjust", "tasminAdjust", "hursmaxAdjust", "hursminAdjust",
+              "prtotAdjust", "rsdsAdjust", "sfcWindAdjust"]       # present in both historical and ssp370
+TARGET = "tasmaxAdjust"
+DEM_PATH = DATA_DIR / "1D_data" / "gebco_2025_n-20.82_s-21.45_w55.15_e55.9.nc"
+COARSE_KM = 150
 MODELS_DIR = Path("models") / "unet_3km"
 
 
-def load_variable(pattern, var):
+def load_variable(scenario, var):
     import xarray as xr
 
-    files = sorted(glob.glob(pattern.format(var = var)))
+    files = sorted(glob.glob(str(ALADIN_DIR / scenario / "day" / var / "*.nc")))
     if not files:
-        raise FileNotFoundError(f"No files for '{var}' matching {pattern.format(var = var)}")
+        raise FileNotFoundError(f"No files for '{var}' in {ALADIN_DIR / scenario / 'day' / var}")
 
-    ds = xr.open_mfdataset(files, combine = "by_coords")
-    da = ds[var] if var in ds.data_vars else ds[list(ds.data_vars)[0]]
-    da = da.squeeze(drop = True)
-    da["time"] = da["time"].dt.floor("D")    # daily data: align on dates only
-    return da.transpose("time", ...)         # (time, y, x)
+    parts = []
+    for f in files:
+        with xr.open_dataset(f) as ds:
+            parts.append(ds[var].load())
+    da = xr.concat(parts, dim = "time") if len(parts) > 1 else parts[0]
+    da = da.assign_coords(time = da["time"].dt.floor("D"))      # daily data: align on dates only
+    return da.transpose("time", "lat", "lon")
 
 
-def load_orography(path):
+def load_dem(path, lat, lon):
+    # Averages the ~450 m GEBCO elevation over one 3 km cell, samples it at the grid centres,
+    # and puts sea (<= 0 m) and cells outside the DEM extent at 0 m.
     import xarray as xr
 
-    ds = xr.open_dataset(path)
-    da = ds["orog"] if "orog" in ds.data_vars else ds[list(ds.data_vars)[0]]
-    da = da.squeeze(drop = True)
-    if "time" in da.dims:
-        da = da.isel(time = 0, drop = True)
-    return da                                # (y, x)
+    with xr.open_dataset(path) as ds:
+        dem = ds["elevation"].load()
+    window = {d: max(1, int(round(abs(float(c[1] - c[0])) / abs(float(dem[d][1] - dem[d][0])))))
+              for d, c in (("lat", lat), ("lon", lon))}
+    dem = dem.rolling(window, center = True, min_periods = 1).mean()
+    dem = dem.interp(lat = lat, lon = lon).clip(min = 0).fillna(0)
+    return dem.values.astype(np.float32)                         # (H, W)
 
 
-def check_same_grid(reference, others):
-    # Same-grid training only makes sense if every field sits on exactly the target pixels
-    spatial_dims = [d for d in reference.dims if d != "time"]
-    for da in others:
-        da_dims = [d for d in da.dims if d != "time"]
-        if da.shape[-2:] != reference.shape[-2:]:
-            raise ValueError(f"'{da.name}' grid {da.shape[-2:]} != target grid {reference.shape[-2:]}")
-        for ref_name in list(spatial_dims) + ["lat", "lon"]:
-            if ref_name in reference.coords and ref_name in da.coords:
-                if not np.allclose(reference[ref_name].values, da[ref_name].values, atol = 1e-4, equal_nan = True):
-                    raise ValueError(f"'{da.name}' coordinate '{ref_name}' differs from the target grid")
-        if da_dims != spatial_dims:
-            print(f"Warning: '{da.name}' dims {da_dims} differ from target dims {spatial_dims}, shapes match")
+def coarsen_to_vector(X, lat, lon, coarse_km = COARSE_KM, chunk = 2000):
+    # (T, V, H, W) 3 km fields -> (T, V * gh * gw): block mean (NaN-aware, sea ignored) over ~coarse_km cells.
+    # A cell never exceeds the domain, so a domain smaller than coarse_km (e.g. La Reunion) gives one value per variable.
+    T, V, H, W = X.shape
+    km_y = abs(float(lat[1] - lat[0])) * 111.2
+    km_x = abs(float(lon[1] - lon[0])) * 111.2 * np.cos(np.deg2rad(float(np.mean(lat))))
+    fy, fx = min(H, max(1, round(coarse_km / km_y))), min(W, max(1, round(coarse_km / km_x)))
+    gh, gw = -(-H // fy), -(-W // fx)
+
+    out = np.empty((T, V * gh * gw), dtype = np.float32)
+    for t0 in range(0, T, chunk):
+        block = np.full((min(chunk, T - t0), V, gh * fy, gw * fx), np.nan, dtype = np.float32)
+        block[..., :H, :W] = X[t0:t0 + chunk]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category = RuntimeWarning)          # all-NaN cells -> NaN
+            coarse = np.nanmean(block.reshape(len(block), V, gh, fy, gw, fx), axis = (3, 5))
+        out[t0:t0 + chunk] = coarse.reshape(len(block), -1)
+    return out
 
 
-def load_data(lr_pattern, lr_variables, hr_pattern, hr_target, same_grid = True, orog_path = None):
+def load_data(scenario, predictors, target = None, coarse_km = COARSE_KM):
     import xarray as xr
 
-    lr = [load_variable(lr_pattern, v) for v in lr_variables]
-    hr = load_variable(hr_pattern, hr_target)
-    *lr, hr = xr.align(*lr, hr, join = "inner", exclude = [d for d in hr.dims if d != "time"])
+    das = [load_variable(scenario, v) for v in predictors]
+    if target is not None:
+        das.append(load_variable(scenario, target))
+    das = xr.align(*das, join = "inner")                         # common days (same lat/lon on every file)
+    lat, lon = das[0]["lat"].values, das[0]["lon"].values
 
-    static = [load_orography(orog_path)] if orog_path else []
-    if same_grid:
-        check_same_grid(hr, lr + static)
-    elif static and static[0].shape != lr[0].shape[-2:]:
-        raise ValueError(f"Orography grid {static[0].shape} != predictor grid {lr[0].shape[-2:]}")
-
-    channels = [da.values for da in lr] + [np.broadcast_to(da.values, lr[0].shape) for da in static]
-    X = np.stack(channels, axis = 1).astype(np.float32)                  # (T, C, h, w)
-    Y = hr.values[:, None].astype(np.float32)                            # (T, 1, H, W)
-    print(f"Common days: {X.shape[0]} | LR {X.shape[2:]} -> HR {Y.shape[2:]}")
-    return X, Y
+    X = np.stack([da.values for da in das[:len(predictors)]], axis = 1).astype(np.float32)     # (T, V, H, W)
+    features = coarsen_to_vector(X, lat, lon, coarse_km)                                         # (T, F)
+    Y = das[-1].values[:, None].astype(np.float32) if target is not None else None               # (T, 1, H, W)
+    times = das[0]["time"].values
+    print(f"[{scenario}] days: {len(times)} | grid {X.shape[2:]} -> 1D features {features.shape[1]} (~{coarse_km} km)")
+    return features, Y, times, lat, lon
 
 
 def chronological_splits(n, val_frac = 0.15, test_frac = 0.15):
@@ -586,17 +659,16 @@ def chronological_splits(n, val_frac = 0.15, test_frac = 0.15):
     return idx[:n - n_val - n_test], idx[n - n_val - n_test:n - n_test], idx[n - n_test:]
 
 
-def normalization_stats(X, Y):
-    return {"x_mean": np.nanmean(X, axis = (0, 2, 3)).tolist(), "x_std": np.nanstd(X, axis = (0, 2, 3)).tolist(),
-            "y_mean": float(np.nanmean(Y)), "y_std": float(np.nanstd(Y))}
+def normalization_stats(features, Y, dem):
+    return {"f_mean": np.nanmean(features, axis = 0).tolist(), "f_std": np.nanstd(features, axis = 0).tolist(),
+            "y_mean": float(np.nanmean(Y)), "y_std": float(np.nanstd(Y)),
+            "dem_mean": float(dem.mean()), "dem_std": float(dem.std())}
 
 
-def normalize(X, Y, stats):
-    x_mean = np.array(stats["x_mean"], dtype = np.float32)[None, :, None, None]
-    x_std = np.array(stats["x_std"], dtype = np.float32)[None, :, None, None] + 1e-8
-    X = np.nan_to_num((X - x_mean) / x_std)                  # NaN (e.g. sea) -> 0 in the inputs
-    Y = (Y - stats["y_mean"]) / (stats["y_std"] + 1e-8)       # NaN kept in target, masked in the loss
-    return X, Y
+def normalize_features(features, stats):
+    f_mean = np.array(stats["f_mean"], dtype = np.float32)
+    f_std = np.array(stats["f_std"], dtype = np.float32) + 1e-8
+    return np.nan_to_num((features - f_mean) / f_std).astype(np.float32)
 
 
 def pad_to_multiple(x, multiple):
@@ -607,27 +679,25 @@ def pad_to_multiple(x, multiple):
 
 
 class DownscalingModel(nn.Module):
-    # Wraps the UNET: pads the input, crops the (x scale_factor) output and resizes it onto the exact 3 km grid.
-    # With scale_factor = 1 (upscaled predictors) the UNET keeps the input resolution.
-    def __init__(self, in_channels, lr_shape, hr_shape, number_of_blocks = 4, scale_factor = SCALE_FACTOR, **unet_kwargs) -> None:
+    # Wraps the UNET. The DEM is stored as a buffer (it is the same for every day) and fed as the 2D input,
+    # the coarse predictor vector is the 1D input injected at the bottleneck. Output: (N, 1, H, W) on the 3 km grid.
+    def __init__(self, static, n_features, number_of_blocks = 4, neurons = (64, 128, 256), **unet_kwargs) -> None:
         super().__init__()
 
         self.multiple = 2 ** number_of_blocks
-        self.scale_factor = scale_factor
-        self.hr_shape = tuple(hr_shape)
-        padded = [s + (-s) % self.multiple for s in lr_shape]
+        static = torch.as_tensor(static, dtype = torch.float32)[None]          # (1, S, H, W)
+        static, self.hr_shape = pad_to_multiple(static, self.multiple)
+        self.register_buffer("static", static)
 
-        self.unet = UNET(input_shape_2D = (1, in_channels, *padded), output_channels = 1,
-                         number_of_blocks = number_of_blocks,
-                         double_resolution_times = int(np.log2(scale_factor)),
+        self.unet = UNET(input_shape_2D = (1, *static.shape[1:]), input_shape_1D = (1, n_features),
+                         output_channels = 1, number_of_blocks = number_of_blocks,
+                         inputNN_neurons_list = list(neurons), double_resolution_times = 0,
                          **unet_kwargs)
 
-    def forward(self, x):
-        x, (h, w) = pad_to_multiple(x, self.multiple)
-        x = self.unet(x)[..., :h * self.scale_factor, :w * self.scale_factor]
-        if x.shape[-2:] != self.hr_shape:
-            x = F.interpolate(x, size = self.hr_shape, mode = "bilinear", align_corners = False)
-        return x
+    def forward(self, x_1D):
+        h, w = self.hr_shape
+        x_2D = self.static.expand(x_1D.shape[0], -1, -1, -1)
+        return self.unet(x_2D, x_1D)[..., :h, :w]
 
 
 def masked_mse(y_pred, y_true):
@@ -651,32 +721,45 @@ def run_epoch(model, loader, device, optimizer = None):
     return total / n
 
 
+def build_model(stats, n_features, dem, device):
+    static = ((dem - stats["dem_mean"]) / (stats["dem_std"] + 1e-8))[None]      # (1, H, W): one static channel
+    return DownscalingModel(static = static, n_features = n_features,
+                            neurons = stats["dense_neurons"],
+                            input_number_kernels = stats["base_channels"],
+                            dropout_rate_2D = stats["dropout"],
+                            dropout_rate_1Dinput = stats["dropout"]).to(device)
+
+
 def train(args):
     from torch.utils.data import DataLoader, TensorDataset
 
     MODELS_DIR.mkdir(parents = True, exist_ok = True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    X, Y = load_data(args.lr_pattern, args.lr_variables, args.hr_pattern, args.hr_target,
-                     same_grid = args.scale_factor == 1, orog_path = args.orog_path)
-    idx_train, idx_val, idx_test = chronological_splits(X.shape[0])
+    features, Y, times, lat, lon = load_data("historical", args.predictors, args.target, args.coarse_km)
+    dem = load_dem(args.dem_path, lat, lon)
+    land_mask = ~np.isnan(Y[0, 0])
+    np.save(MODELS_DIR / "land_mask.npy", land_mask)
+    print(f"DEM {dem.shape}: {dem.min():.0f}-{dem.max():.0f} m | land pixels: {land_mask.sum()}/{land_mask.size}")
+
+    idx_train, idx_val, idx_test = chronological_splits(len(features))
     np.savez(MODELS_DIR / "splits.npz", train = idx_train, val = idx_val, test = idx_test)
 
-    stats = normalization_stats(X[idx_train], Y[idx_train])
-    stats.update({"lr_variables": args.lr_variables, "hr_target": args.hr_target,
-                  "orog_path": args.orog_path, "scale_factor": args.scale_factor})
+    stats = normalization_stats(features[idx_train], Y[idx_train], dem)
+    stats.update({"predictors": args.predictors, "target": args.target, "coarse_km": args.coarse_km,
+                  "dem_path": str(args.dem_path), "base_channels": args.base_channels,
+                  "dense_neurons": args.dense_neurons, "dropout": args.dropout, "n_features": features.shape[1]})
     json.dump(stats, open(MODELS_DIR / "normalization_stats.json", "w"), indent = 2)
-    X, Y = normalize(X, Y, stats)
+
+    features = normalize_features(features, stats)
+    Y = (Y - stats["y_mean"]) / (stats["y_std"] + 1e-8)           # NaN (sea) kept in the target, masked in the loss
 
     def loader(idx, shuffle):
-        return DataLoader(TensorDataset(torch.from_numpy(X[idx]), torch.from_numpy(Y[idx])),
-                          batch_size = args.batch_size, shuffle = shuffle)
+        return DataLoader(TensorDataset(torch.from_numpy(features[idx]), torch.from_numpy(Y[idx])),
+                          batch_size = args.batch_size, shuffle = shuffle, drop_last = shuffle)   # BatchNorm1d needs > 1 sample
     train_loader, val_loader = loader(idx_train, True), loader(idx_val, False)
 
-    model = DownscalingModel(in_channels = X.shape[1], lr_shape = X.shape[2:], hr_shape = Y.shape[2:],
-                             scale_factor = args.scale_factor,
-                             input_number_kernels = args.base_channels,
-                             dropout_rate_2D = args.dropout).to(device)
+    model = build_model(stats, features.shape[1], dem, device)
     optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor = 0.5, patience = 7)
     print(f"Device: {device} | parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -703,20 +786,50 @@ def train(args):
     print(f"Best val MSE {best_val:.4f} | test RMSE {rmse:.4f} (target units) | weights: {MODELS_DIR / 'best.pt'}")
 
 
+def predict(args):
+    # Applies the trained model to a scenario (default ssp370) and writes the 3 km field to NetCDF
+    import xarray as xr
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    stats = json.load(open(MODELS_DIR / "normalization_stats.json"))
+    land_mask = np.load(MODELS_DIR / "land_mask.npy")
+
+    features, _, times, lat, lon = load_data(args.scenario, stats["predictors"], None, stats["coarse_km"])
+    dem = load_dem(stats["dem_path"], lat, lon)
+    features = normalize_features(features, stats)
+
+    model = build_model(stats, features.shape[1], dem, device)
+    model.load_state_dict(torch.load(MODELS_DIR / "best.pt", map_location = device))
+    model.eval()
+
+    preds = []
+    with torch.no_grad():
+        for i in range(0, len(features), 256):
+            preds.append(model(torch.from_numpy(features[i:i + 256]).to(device)).cpu().numpy())
+    pred = np.concatenate(preds)[:, 0] * stats["y_std"] + stats["y_mean"]
+    pred = np.where(land_mask[None], pred, np.nan).astype(np.float32)
+
+    out = MODELS_DIR / f"{stats['target']}_{args.scenario}_3km_pred.nc"
+    xr.DataArray(pred, dims = ("time", "lat", "lon"), coords = {"time": times, "lat": lat, "lon": lon},
+                 name = stats["target"]).to_netcdf(out)
+    print(f"Saved {out}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description = "Train the UNET to downscale to 3 km resolution")
-    parser.add_argument("--lr-pattern", default = LR_PATTERN, help = "glob of (upscaled) predictor files, '{var}' = variable name")
-    parser.add_argument("--lr-variables", nargs = "+", default = LR_VARIABLES)
-    parser.add_argument("--hr-pattern", default = HR_PATTERN, help = "glob of 3 km target files, '{var}' = variable name")
-    parser.add_argument("--hr-target", default = HR_TARGET)
-    parser.add_argument("--orog-path", default = OROG_PATH, help = "optional orography file, added as an input channel")
-    parser.add_argument("--scale-factor", type = int, default = SCALE_FACTOR, choices = [1, 2, 4, 8],
-                        help = "1 = predictors already on the 3 km grid, 4 = raw 12 km predictors")
+    parser = argparse.ArgumentParser(description = "UNET: coarse (~150 km) predictors + DEM -> 3 km downscaling")
+    parser.add_argument("--mode", choices = ["train", "predict"], default = "train",
+                        help = "train on historical, or predict a scenario with the saved model")
+    parser.add_argument("--scenario", default = "ssp370", help = "scenario used by --mode predict")
+    parser.add_argument("--predictors", nargs = "+", default = PREDICTORS)
+    parser.add_argument("--target", default = TARGET)
+    parser.add_argument("--dem-path", default = DEM_PATH)
+    parser.add_argument("--coarse-km", type = float, default = COARSE_KM, help = "resolution of the 1D predictors (GCM-like)")
     parser.add_argument("--base-channels", type = int, default = 32)
+    parser.add_argument("--dense-neurons", type = int, nargs = "+", default = [64, 128, 256], help = "InputBlock1D layers")
     parser.add_argument("--dropout", type = float, default = 0.)
     parser.add_argument("--batch-size", type = int, default = 16)
     parser.add_argument("--lr", type = float, default = 1e-4)
     parser.add_argument("--epochs", type = int, default = 75)
     parser.add_argument("--patience", type = int, default = 15)
-    train(parser.parse_args())
-
+    args = parser.parse_args()
+    train(args) if args.mode == "train" else predict(args)
