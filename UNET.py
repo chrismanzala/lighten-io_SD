@@ -578,7 +578,7 @@ class UNET(nn.Module):
 
 DATA_DIR = Path("/mnt/nas/Data")
 ALADIN_DIR = DATA_DIR / "METEO_FRANCE" / "DONNEES_SIMULATIONS" / "ALADIN" / "ALADIN_CORRIGE"   # {historical,ssp370}/day/{var}/*.nc
-PREDICTORS = ["tasmaxAdjust", "tasminAdjust", "hursmaxAdjust", "hursminAdjust",
+PREDICTORS = ["tasminAdjust", "hursmaxAdjust", "hursminAdjust",
               "prtotAdjust", "rsdsAdjust", "sfcWindAdjust"]       # present in both historical and ssp370
 TARGET = "tasmaxAdjust"
 DEM_PATH = DATA_DIR / "1D_data" / "gebco_2025_n-20.82_s-21.45_w55.15_e55.9.nc"
