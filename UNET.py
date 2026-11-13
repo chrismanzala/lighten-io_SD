@@ -4,14 +4,15 @@ UNET.py - U-Net statistical downscaling (PyTorch)
 
 Purpose
 -------
-Downscale daily climate variables over La Reunion from ~150 km (GCM-like) resolution
+Downscale daily climate variables over La Reunion from the CNRM-ESM2-1 GCM grid (~1.4 deg)
 to 3 km, using the bias-corrected ALADIN data (ALADIN_CORRIGE) and a DEM.
 
 Inputs / output
 ---------------
-  1D input : predictors upscaled to ~COARSE_KM (block mean, sea ignored) and flattened
-             to a vector (T, V * gh * gw). Domain < 150 km  ->  one value per variable.
-             Goes through InputBlock1D (dense stack) and is injected at the bottleneck.
+  1D input : each predictor upscaled onto the GCM grid: mean of the 3 km land pixels inside
+             each 1.4 deg cell. The domain overlaps 2 x 2 GCM cells, so 6 variables x 4 cells
+             = 24 numbers per day. Goes through InputBlock1D (dense stack) and is injected
+             at the bottleneck.
   2D input : static DEM (GEBCO, averaged onto the 3 km grid, sea = 0 m), one channel.
              Goes through InputBlock2D and the skip connections.
   output   : target variable on the 3 km grid, (N, 1, H, W).
@@ -32,36 +33,45 @@ Architecture (default: 32 base channels, 4 blocks)
   H and W must be multiples of 2**number_of_blocks: DownscalingModel pads the static
   DEM and crops the output back to the 3 km grid.
 
-Pipeline
---------
-  load_data -> coarsen_to_vector -> normalization (train-split stats) -> DownscalingModel
-  (DEM stored as a buffer, same for every day) -> masked MSE on land pixels.
+Training and evaluation
+-----------------------
+  historical (1981-2014) and ssp370 (2015-2100) are joined into one daily series.
+  Blocked time cross-validation: the series is cut into consecutive 5-year blocks
+  (1981-1985, ..., 2096-2100: 24 folds). In each fold one block is the test set, the
+  block before it (after it for the first fold) is the validation set for early stopping,
+  and all other days are training data. Normalization statistics come from the fold's
+  training days only. Loss: masked MSE on land pixels.
 
 Data (under DATA_DIR = /mnt/nas/Data)
 -------------------------------------
   METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE/{historical,ssp370}/day/{var}/*.nc
-  1D_data/gebco_2025_*.nc   (DEM, variable "elevation")
-  Predictors: tasmax, tasmin, hursmax, hursmin, prtot, rsds, sfcWind (the *Adjust variables);
-  default target: tasmaxAdjust. historical covers 1981-2014, ssp370 covers 2015-2100.
+  CMIP_CNRM_ESM21/tas_day_*historical*.nc   (only its lat/lon: the GCM grid)
+  DEM/gebco_2025_*.nc                       (DEM, variable "elevation")
+  Predictors: tasmin, hursmax, hursmin, prtot, rsds, sfcWind (the *Adjust variables);
+  default target: tasmaxAdjust (not among the predictors).
 
 Usage
 -----
-  python UNET.py                          # train on historical (chronological 70/15/15 split)
-  python UNET.py --mode predict           # apply the saved model to ssp370
-  python UNET.py --target tasminAdjust --epochs 75 --base-channels 32 --coarse-km 150
+  python UNET.py                          # all 24 folds
+  python UNET.py --folds 0 23             # only some folds (indices printed at start)
+  python UNET.py --test-years 10 --target tasminAdjust --batch-size 64
 
 Outputs (models/unet_3km/)
 --------------------------
-  best.pt, normalization_stats.json, splits.npz, land_mask.npy,
-  {target}_{scenario}_3km_pred.nc  (from --mode predict)
+  land_mask.npy, cv_summary.csv (all folds trained so far, pooled RMSE printed)
+  fold_XX_YYYY-YYYY/: best.pt, normalization_stats.json, metrics.json,
+                      {target}_pred_YYYY-YYYY.nc (out-of-fold predictions for the test block)
 
 Known limitations
 -----------------
+  - Upscaled ALADIN is a stand-in for the GCM: real CNRM-ESM2-1 cells also include ocean.
+  - ssp370 files mix ALADIN63 and ALADIN64 runs (see file names).
+  - Neighbouring blocks share a boundary: the last days of one block and the first days of
+    the next are correlated (weather persists a few days). Small effect with 5-year blocks.
   - ContractiveBlock loop in UNET.__init__: block 0 is built then overwritten by the
     `else` branch, so it does not use replicate padding.
   - DoubleResolutionLayer ignores `output_padding`; ExpansiveBlock does not pass
     `dropout_rate` to it.
-  - ssp370 goes beyond the 1981-2014 training range: check extrapolation.
 """
 
 import argparse
@@ -569,20 +579,24 @@ class UNET(nn.Module):
 
 
 # =====================================================================
-# Training: coarse (~150 km, GCM-like) predictors + DEM  ->  3 km target
+# Training: GCM-grid (1.4 deg) predictors + DEM  ->  3 km target
 #   2D input : static DEM on the 3 km grid  (InputBlock2D + skip connections)
-#   1D input : predictors upscaled to ~COARSE_KM, flattened to a vector (InputBlock1D -> bottleneck)
+#   1D input : predictors upscaled onto the CNRM-ESM2-1 grid (~1.4 deg), one value per variable
+#              and per GCM cell overlapping the domain, flattened (InputBlock1D -> bottleneck)
 #   output   : target variable on the 3 km grid (ALADIN_CORRIGE)
-# Train on `historical`, apply to `ssp370` with --mode predict.
+# Data: historical (1981-2014) + ssp370 (2015-2100), joined in time.
+# Evaluation: blocked time cross-validation, one 5-year test block per fold.
 # =====================================================================
 
 DATA_DIR = Path("/mnt/nas/Data")
-ALADIN_DIR = DATA_DIR / "METEO_FRANCE" / "DONNEES_SIMULATIONS" / "ALADIN" / "ALADIN_CORRIGE"   # {historical,ssp370}/day/{var}/*.nc
+ALADIN_DIR = DATA_DIR / "METEO_FRANCE" / "DONNEES_SIMULATIONS" / "ALADIN" / "ALADIN_CORRIGE"   # {scenario}/day/{var}/*.nc
+SCENARIOS = ["historical", "ssp370"]
 PREDICTORS = ["tasminAdjust", "hursmaxAdjust", "hursminAdjust",
-              "prtotAdjust", "rsdsAdjust", "sfcWindAdjust"]       # present in both historical and ssp370
+              "prtotAdjust", "rsdsAdjust", "sfcWindAdjust"]       # present in both historical and ssp370; target excluded
 TARGET = "tasmaxAdjust"
-DEM_PATH = DATA_DIR / "1D_data" / "gebco_2025_n-20.82_s-21.45_w55.15_e55.9.nc"
-COARSE_KM = 150
+DEM_PATH = DATA_DIR / "DEM" / "gebco_2025_n-20.82_s-21.45_w55.15_e55.9.nc"
+GCM_GRID_FILE = DATA_DIR / "CMIP_CNRM_ESM21" / "tas_day_CNRM-ESM2-1_historical_r1i1p1f2_gr_18500101-20141231.nc"
+TEST_YEARS = 5
 MODELS_DIR = Path("models") / "unet_3km"
 
 
@@ -602,6 +616,14 @@ def load_variable(scenario, var):
     return da.transpose("time", "lat", "lon")
 
 
+def load_variable_all(scenarios, var):
+    import xarray as xr
+
+    da = xr.concat([load_variable(s, var) for s in scenarios], dim = "time")
+    _, keep = np.unique(da["time"].values, return_index = True)   # drop duplicated dates at scenario joins, if any
+    return da.isel(time = np.sort(keep))
+
+
 def load_dem(path, lat, lon):
     # Averages the ~450 m GEBCO elevation over one 3 km cell, samples it at the grid centres,
     # and puts sea (<= 0 m) and cells outside the DEM extent at 0 m.
@@ -616,47 +638,73 @@ def load_dem(path, lat, lon):
     return dem.values.astype(np.float32)                         # (H, W)
 
 
-def coarsen_to_vector(X, lat, lon, coarse_km = COARSE_KM, chunk = 2000):
-    # (T, V, H, W) 3 km fields -> (T, V * gh * gw): block mean (NaN-aware, sea ignored) over ~coarse_km cells.
-    # A cell never exceeds the domain, so a domain smaller than coarse_km (e.g. La Reunion) gives one value per variable.
-    T, V, H, W = X.shape
-    km_y = abs(float(lat[1] - lat[0])) * 111.2
-    km_x = abs(float(lon[1] - lon[0])) * 111.2 * np.cos(np.deg2rad(float(np.mean(lat))))
-    fy, fx = min(H, max(1, round(coarse_km / km_y))), min(W, max(1, round(coarse_km / km_x)))
-    gh, gw = -(-H // fy), -(-W // fx)
+def gcm_cells(lat, lon, gcm_grid_file = GCM_GRID_FILE):
+    # Labels each 3 km pixel with the GCM cell that contains it (nearest GCM cell centre = inside its bounds).
+    import xarray as xr
 
-    out = np.empty((T, V * gh * gw), dtype = np.float32)
-    for t0 in range(0, T, chunk):
-        block = np.full((min(chunk, T - t0), V, gh * fy, gw * fx), np.nan, dtype = np.float32)
-        block[..., :H, :W] = X[t0:t0 + chunk]
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category = RuntimeWarning)          # all-NaN cells -> NaN
-            coarse = np.nanmean(block.reshape(len(block), V, gh, fy, gw, fx), axis = (3, 5))
-        out[t0:t0 + chunk] = coarse.reshape(len(block), -1)
+    with xr.open_dataset(gcm_grid_file) as ds:
+        g_lat, g_lon = ds["lat"].values, ds["lon"].values % 360
+    iy = np.abs(lat[:, None] - g_lat[None, :]).argmin(axis = 1)          # (H,)
+    ix = np.abs((lon[:, None] % 360) - g_lon[None, :]).argmin(axis = 1)  # (W,)
+    cell = iy[:, None] * len(g_lon) + ix[None, :]                        # (H, W) global cell id
+    ids, labels = np.unique(cell, return_inverse = True)
+    centres = [(float(g_lat[i // len(g_lon)]), float(g_lon[i % len(g_lon)])) for i in ids]
+    return labels.reshape(cell.shape), centres
+
+
+def upscale_to_gcm(values, labels, n_cells):
+    # (T, H, W) 3 km field -> (T, n_cells): mean of the valid (land) pixels inside each GCM cell
+    flat = values.reshape(len(values), -1)
+    out = np.full((len(values), n_cells), np.nan, dtype = np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category = RuntimeWarning)               # cell without land -> NaN
+        for k in range(n_cells):
+            out[:, k] = np.nanmean(flat[:, labels.ravel() == k], axis = 1)
     return out
 
 
-def load_data(scenario, predictors, target = None, coarse_km = COARSE_KM):
-    import xarray as xr
+def load_data(scenarios, predictors, target, gcm_grid_file = GCM_GRID_FILE):
+    y_da = load_variable_all(scenarios, target)
+    lat, lon = y_da["lat"].values, y_da["lon"].values
+    labels, centres = gcm_cells(lat, lon, gcm_grid_file)
+    first = y_da.values[0].ravel()
+    land_cells = [k for k in range(len(centres)) if np.isfinite(first[labels.ravel() == k]).any()]
 
-    das = [load_variable(scenario, v) for v in predictors]
-    if target is not None:
-        das.append(load_variable(scenario, target))
-    das = xr.align(*das, join = "inner")                         # common days (same lat/lon on every file)
-    lat, lon = das[0]["lat"].values, das[0]["lon"].values
+    upscaled = []                                                # one variable at a time keeps memory low
+    for v in predictors:
+        da = load_variable_all(scenarios, v)
+        up = upscale_to_gcm(da.values.astype(np.float32), labels, len(centres))[:, land_cells]
+        upscaled.append((da["time"].values, up, v))
 
-    X = np.stack([da.values for da in das[:len(predictors)]], axis = 1).astype(np.float32)     # (T, V, H, W)
-    features = coarsen_to_vector(X, lat, lon, coarse_km)                                         # (T, F)
-    Y = das[-1].values[:, None].astype(np.float32) if target is not None else None               # (T, 1, H, W)
-    times = das[0]["time"].values
-    print(f"[{scenario}] days: {len(times)} | grid {X.shape[2:]} -> 1D features {features.shape[1]} (~{coarse_km} km)")
-    return features, Y, times, lat, lon
+    times = y_da["time"].values
+    for t, _, _ in upscaled:
+        times = np.intersect1d(times, t)                         # days present in every variable
+
+    cols, names = [], []
+    for t, up, v in upscaled:
+        cols.append(up[np.searchsorted(t, times)])
+        names += [f"{v}@{centres[k][0]:.2f}N,{centres[k][1]:.2f}E" for k in land_cells]
+    features = np.concatenate(cols, axis = 1).astype(np.float32)                 # (T, V * cells)
+    Y = y_da.sel(time = times).values[:, None].astype(np.float32)               # (T, 1, H, W)
+
+    print(f"{'+'.join(scenarios)}: {len(times)} days ({str(times[0])[:10]} -> {str(times[-1])[:10]}) | "
+          f"grid {Y.shape[2:]} | GCM cells with land: {len(land_cells)} -> 1D features {features.shape[1]}")
+    return features, Y, times, lat, lon, names
 
 
-def chronological_splits(n, val_frac = 0.15, test_frac = 0.15):
-    n_test, n_val = int(n * test_frac), int(n * val_frac)
-    idx = np.arange(n)
-    return idx[:n - n_val - n_test], idx[n - n_val - n_test:n - n_test], idx[n - n_test:]
+def time_folds(times, test_years = TEST_YEARS):
+    # Blocked time cross-validation: consecutive test_years blocks; each block is the test set once,
+    # the block before it (after it, for the first) is the validation set for early stopping, the rest is training.
+    years = times.astype("datetime64[Y]").astype(int) + 1970
+    starts = np.arange(years.min(), years.max() + 1, test_years)
+    blocks = [np.where((years >= s) & (years < s + test_years))[0] for s in starts]
+    folds = []
+    for k, test in enumerate(blocks):
+        val = blocks[k - 1] if k > 0 else blocks[k + 1]
+        train = np.setdiff1d(np.arange(len(times)), np.concatenate([test, val]))
+        folds.append({"fold": k, "years": (int(years[test].min()), int(years[test].max())),
+                      "train": train, "val": val, "test": test})
+    return folds
 
 
 def normalization_stats(features, Y, dem):
@@ -730,100 +778,120 @@ def build_model(stats, n_features, dem, device):
                             dropout_rate_1Dinput = stats["dropout"]).to(device)
 
 
-def train(args):
+def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, device):
     from torch.utils.data import DataLoader, TensorDataset
+    import xarray as xr
 
-    MODELS_DIR.mkdir(parents = True, exist_ok = True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    (y0, y1), k = fold["years"], fold["fold"]
+    out_dir = MODELS_DIR / f"fold_{k:02d}_{y0}-{y1}"
+    out_dir.mkdir(parents = True, exist_ok = True)
+    idx_train, idx_val, idx_test = fold["train"], fold["val"], fold["test"]
+    print(f"\n=== Fold {k}: test {y0}-{y1} | train {len(idx_train)} days, val {len(idx_val)}, test {len(idx_test)} ===")
 
-    features, Y, times, lat, lon = load_data("historical", args.predictors, args.target, args.coarse_km)
-    dem = load_dem(args.dem_path, lat, lon)
-    land_mask = ~np.isnan(Y[0, 0])
-    np.save(MODELS_DIR / "land_mask.npy", land_mask)
-    print(f"DEM {dem.shape}: {dem.min():.0f}-{dem.max():.0f} m | land pixels: {land_mask.sum()}/{land_mask.size}")
-
-    idx_train, idx_val, idx_test = chronological_splits(len(features))
-    np.savez(MODELS_DIR / "splits.npz", train = idx_train, val = idx_val, test = idx_test)
-
+    # Statistics from this fold's training days only
     stats = normalization_stats(features[idx_train], Y[idx_train], dem)
-    stats.update({"predictors": args.predictors, "target": args.target, "coarse_km": args.coarse_km,
+    stats.update({"predictors": args.predictors, "target": args.target, "scenarios": args.scenarios,
                   "dem_path": str(args.dem_path), "base_channels": args.base_channels,
-                  "dense_neurons": args.dense_neurons, "dropout": args.dropout, "n_features": features.shape[1]})
-    json.dump(stats, open(MODELS_DIR / "normalization_stats.json", "w"), indent = 2)
+                  "dense_neurons": args.dense_neurons, "dropout": args.dropout,
+                  "n_features": features.shape[1], "feature_names": names, "fold": k, "test_years": [y0, y1]})
+    json.dump(stats, open(out_dir / "normalization_stats.json", "w"), indent = 2)
 
-    features = normalize_features(features, stats)
-    Y = (Y - stats["y_mean"]) / (stats["y_std"] + 1e-8)           # NaN (sea) kept in the target, masked in the loss
+    f_norm = normalize_features(features, stats)
+    Y_norm = (Y - stats["y_mean"]) / (stats["y_std"] + 1e-8)     # NaN (sea) kept, masked in the loss
 
     def loader(idx, shuffle):
-        return DataLoader(TensorDataset(torch.from_numpy(features[idx]), torch.from_numpy(Y[idx])),
+        return DataLoader(TensorDataset(torch.from_numpy(f_norm[idx]), torch.from_numpy(Y_norm[idx])),
                           batch_size = args.batch_size, shuffle = shuffle, drop_last = shuffle)   # BatchNorm1d needs > 1 sample
     train_loader, val_loader = loader(idx_train, True), loader(idx_val, False)
 
     model = build_model(stats, features.shape[1], dem, device)
     optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor = 0.5, patience = 7)
-    print(f"Device: {device} | parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     best_val, epochs_without_improvement = float("inf"), 0
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(model, train_loader, device, optimizer)
         val_loss = run_epoch(model, val_loader, device)
         scheduler.step(val_loss)
-        print(f"Epoch {epoch:3d} | train MSE {train_loss:.4f} | val MSE {val_loss:.4f}")
+        print(f"Fold {k} | epoch {epoch:3d} | train MSE {train_loss:.4f} | val MSE {val_loss:.4f}")
 
         if val_loss < best_val:
             best_val, epochs_without_improvement = val_loss, 0
-            torch.save(model.state_dict(), MODELS_DIR / "best.pt")
+            torch.save(model.state_dict(), out_dir / "best.pt")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.patience:
                 print("Early stopping")
                 break
 
-    model.load_state_dict(torch.load(MODELS_DIR / "best.pt", map_location = device))
-    test_loss = run_epoch(model, loader(idx_test, False), device)
-    rmse = np.sqrt(test_loss) * stats["y_std"]
-    print(f"Best val MSE {best_val:.4f} | test RMSE {rmse:.4f} (target units) | weights: {MODELS_DIR / 'best.pt'}")
-
-
-def predict(args):
-    # Applies the trained model to a scenario (default ssp370) and writes the 3 km field to NetCDF
-    import xarray as xr
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    stats = json.load(open(MODELS_DIR / "normalization_stats.json"))
-    land_mask = np.load(MODELS_DIR / "land_mask.npy")
-
-    features, _, times, lat, lon = load_data(args.scenario, stats["predictors"], None, stats["coarse_km"])
-    dem = load_dem(stats["dem_path"], lat, lon)
-    features = normalize_features(features, stats)
-
-    model = build_model(stats, features.shape[1], dem, device)
-    model.load_state_dict(torch.load(MODELS_DIR / "best.pt", map_location = device))
+    # Test block: predictions in target units, scored on land pixels
+    model.load_state_dict(torch.load(out_dir / "best.pt", map_location = device, weights_only = True))
     model.eval()
-
     preds = []
     with torch.no_grad():
-        for i in range(0, len(features), 256):
-            preds.append(model(torch.from_numpy(features[i:i + 256]).to(device)).cpu().numpy())
+        for i in range(0, len(idx_test), 256):
+            preds.append(model(torch.from_numpy(f_norm[idx_test[i:i + 256]]).to(device)).cpu().numpy())
     pred = np.concatenate(preds)[:, 0] * stats["y_std"] + stats["y_mean"]
     pred = np.where(land_mask[None], pred, np.nan).astype(np.float32)
 
-    out = MODELS_DIR / f"{stats['target']}_{args.scenario}_3km_pred.nc"
-    xr.DataArray(pred, dims = ("time", "lat", "lon"), coords = {"time": times, "lat": lat, "lon": lon},
-                 name = stats["target"]).to_netcdf(out)
-    print(f"Saved {out}")
+    diff = pred - Y[idx_test, 0]
+    metrics = {"fold": k, "test_start": y0, "test_end": y1, "n_train": len(idx_train), "n_test": len(idx_test),
+               "best_val_mse_norm": best_val, "test_rmse": float(np.sqrt(np.nanmean(diff ** 2))),
+               "test_mae": float(np.nanmean(np.abs(diff))), "test_bias": float(np.nanmean(diff)),
+               "n_scored": int(np.isfinite(diff).sum())}
+    json.dump(metrics, open(out_dir / "metrics.json", "w"), indent = 2)
+
+    xr.DataArray(pred, dims = ("time", "lat", "lon"), coords = {"time": times[idx_test], "lat": lat, "lon": lon},
+                 name = args.target).to_netcdf(out_dir / f"{args.target}_pred_{y0}-{y1}.nc")
+    print(f"Fold {k} | test {y0}-{y1}: RMSE {metrics['test_rmse']:.3f} | MAE {metrics['test_mae']:.3f} | "
+          f"bias {metrics['test_bias']:+.3f} (target units)")
+    return metrics
+
+
+def write_cv_summary():
+    # Collects metrics.json of every fold trained so far into cv_summary.csv
+    rows = [json.load(open(p)) for p in sorted(MODELS_DIR.glob("fold_*/metrics.json"))]
+    if not rows:
+        return
+    keys = list(rows[0].keys())
+    with open(MODELS_DIR / "cv_summary.csv", "w") as f:
+        f.write(",".join(keys) + "\n")
+        for r in rows:
+            f.write(",".join(str(r[c]) for c in keys) + "\n")
+    n = np.array([r["n_scored"] for r in rows])
+    pooled_rmse = np.sqrt(np.sum(n * np.array([r["test_rmse"] for r in rows]) ** 2) / n.sum())
+    print(f"\nCV summary ({len(rows)} folds): pooled test RMSE {pooled_rmse:.3f} | "
+          f"per fold min {min(r['test_rmse'] for r in rows):.3f}, max {max(r['test_rmse'] for r in rows):.3f} "
+          f"| {MODELS_DIR / 'cv_summary.csv'}")
+
+
+def train(args):
+    MODELS_DIR.mkdir(parents = True, exist_ok = True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    features, Y, times, lat, lon, names = load_data(args.scenarios, args.predictors, args.target)
+    dem = load_dem(args.dem_path, lat, lon)
+    land_mask = ~np.isnan(Y[0, 0])
+    np.save(MODELS_DIR / "land_mask.npy", land_mask)
+    print(f"DEM {dem.shape}: {dem.min():.0f}-{dem.max():.0f} m | land pixels: {land_mask.sum()}/{land_mask.size} | device: {device}")
+
+    folds = time_folds(times, args.test_years)
+    print("Folds: " + ", ".join(f"{f['fold']}:{f['years'][0]}-{f['years'][1]}" for f in folds))
+    selected = folds if args.folds is None else [folds[k] for k in args.folds]
+
+    for fold in selected:
+        train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, device)
+    write_cv_summary()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description = "UNET: coarse (~150 km) predictors + DEM -> 3 km downscaling")
-    parser.add_argument("--mode", choices = ["train", "predict"], default = "train",
-                        help = "train on historical, or predict a scenario with the saved model")
-    parser.add_argument("--scenario", default = "ssp370", help = "scenario used by --mode predict")
+    parser = argparse.ArgumentParser(description = "UNET: GCM-grid (1.4 deg) predictors + DEM -> 3 km, blocked time cross-validation")
+    parser.add_argument("--scenarios", nargs = "+", default = SCENARIOS, help = "joined in time for training")
+    parser.add_argument("--test-years", type = int, default = TEST_YEARS, help = "length of each test block")
+    parser.add_argument("--folds", type = int, nargs = "+", default = None, help = "fold indices to run (default: all)")
     parser.add_argument("--predictors", nargs = "+", default = PREDICTORS)
     parser.add_argument("--target", default = TARGET)
     parser.add_argument("--dem-path", default = DEM_PATH)
-    parser.add_argument("--coarse-km", type = float, default = COARSE_KM, help = "resolution of the 1D predictors (GCM-like)")
     parser.add_argument("--base-channels", type = int, default = 32)
     parser.add_argument("--dense-neurons", type = int, nargs = "+", default = [64, 128, 256], help = "InputBlock1D layers")
     parser.add_argument("--dropout", type = float, default = 0.)
@@ -831,5 +899,4 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type = float, default = 1e-4)
     parser.add_argument("--epochs", type = int, default = 75)
     parser.add_argument("--patience", type = int, default = 15)
-    args = parser.parse_args()
-    train(args) if args.mode == "train" else predict(args)
+    train(parser.parse_args())
