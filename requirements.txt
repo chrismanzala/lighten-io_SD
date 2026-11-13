@@ -1,0 +1,8 @@
+# Python 3.11 (tested). Install torch first with the build that matches the GPU server's CUDA:
+#   https://pytorch.org/get-started/locally/   e.g. pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.3
+numpy>=1.26
+xarray>=2024.1
+netCDF4>=1.6
+scipy>=1.11
+pandas>=2.0

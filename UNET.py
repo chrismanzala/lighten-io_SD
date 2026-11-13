@@ -42,8 +42,8 @@ Training and evaluation
   and all other days are training data. Normalization statistics come from the fold's
   training days only. Loss: masked MSE on land pixels.
 
-Data (under DATA_DIR = /mnt/nas/Data)
--------------------------------------
+Data (under --data-dir, default /mnt/nas/Data)
+----------------------------------------------
   METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE/{historical,ssp370}/day/{var}/*.nc
   CMIP_CNRM_ESM21/tas_day_*historical*.nc   (only its lat/lon: the GCM grid)
   DEM/gebco_2025_*.nc                       (DEM, variable "elevation")
@@ -55,12 +55,34 @@ Usage
   python UNET.py                          # all 24 folds
   python UNET.py --folds 0 23             # only some folds (indices printed at start)
   python UNET.py --test-years 10 --target tasminAdjust --batch-size 64
+  python UNET.py --help                   # every option with its default
 
-Outputs (models/unet_3km/)
---------------------------
-  land_mask.npy, cv_summary.csv (all folds trained so far, pooled RMSE printed)
-  fold_XX_YYYY-YYYY/: best.pt, normalization_stats.json, metrics.json,
-                      {target}_pred_YYYY-YYYY.nc (out-of-fold predictions for the test block)
+Running on another machine (e.g. a GPU server with the NAS mounted through SSHFS)
+---------------------------------------------------------------------------------
+  Nothing in the code is tied to one machine: paths, device and threads come from flags
+  or environment variables (flag > environment variable > default).
+
+    --data-dir      UNET_DATA_DIR    NAS data root (default /mnt/nas/Data)
+    --models-dir    UNET_MODELS_DIR  outputs (default models/unet_3km, relative to the current folder)
+    --cache-dir     UNET_CACHE_DIR   local cache of the prepared arrays (default: off)
+    --device        UNET_DEVICE      auto | cuda | cuda:1 | mps | cpu (default auto: GPU if found)
+    --threads       UNET_THREADS     CPU threads for torch (default: torch's choice)
+    --aladin-dir, --dem-path, --gcm-grid-file   override single locations inside the data root
+
+  Example:
+    sshfs user@nas:/path/to/Data ~/nas_data -o ro,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3
+    pip install -r requirements.txt       # torch: pick the build matching the server's CUDA
+    export UNET_DATA_DIR=~/nas_data UNET_CACHE_DIR=~/unet_cache UNET_MODELS_DIR=~/unet_runs/run1
+    python UNET.py --dry-run              # checks the mount, reads the data once, fills the cache
+    nohup python UNET.py --amp --batch-size 64 > train.log 2>&1 &
+
+  Notes:
+    - Reading the NetCDF files through SSHFS is the slow part (several GB). With --cache-dir the
+      prepared arrays (~200 MB) are stored on the local disk and later runs skip the NAS.
+    - Write outputs to a local disk (--models-dir) rather than to the SSHFS mount.
+    - On GPU the whole normalized dataset is moved to GPU memory once (~160 MB).
+    - --amp uses mixed precision (bfloat16 when the GPU supports it) for faster training.
+    - run_config.json in --models-dir records the options, host, torch version and device used.
 
 Known limitations
 -----------------
@@ -76,7 +98,12 @@ Known limitations
 
 import argparse
 import glob
+import hashlib
 import json
+import os
+import platform
+import random
+import time
 import warnings
 from pathlib import Path
 
@@ -588,24 +615,32 @@ class UNET(nn.Module):
 # Evaluation: blocked time cross-validation, one 5-year test block per fold.
 # =====================================================================
 
-DATA_DIR = Path("/mnt/nas/Data")
-ALADIN_DIR = DATA_DIR / "METEO_FRANCE" / "DONNEES_SIMULATIONS" / "ALADIN" / "ALADIN_CORRIGE"   # {scenario}/day/{var}/*.nc
+# Paths and machine settings. Each one can be set by a command-line flag or an environment variable,
+# so the same file runs on the NAS host, on a remote GPU machine with the NAS mounted through SSHFS, etc.
+#   priority: command-line flag > environment variable > default below
+DEFAULT_DATA_DIR = "/mnt/nas/Data"                                       # --data-dir    | UNET_DATA_DIR
+DEFAULT_MODELS_DIR = "models/unet_3km"                                   # --models-dir  | UNET_MODELS_DIR
+DEFAULT_CACHE_DIR = ""                                                   # --cache-dir   | UNET_CACHE_DIR ("" = no cache)
+DEFAULT_DEVICE = "auto"                                                  # --device      | UNET_DEVICE
+# Locations inside the data directory (override the full path with --aladin-dir, --dem-path, --gcm-grid-file)
+ALADIN_SUBDIR = "METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE"  # {scenario}/day/{var}/*.nc
+DEM_SUBPATH = "DEM/gebco_2025_n-20.82_s-21.45_w55.15_e55.9.nc"
+GCM_GRID_SUBPATH = "CMIP_CNRM_ESM21/tas_day_CNRM-ESM2-1_historical_r1i1p1f2_gr_18500101-20141231.nc"
+
 SCENARIOS = ["historical", "ssp370"]
 PREDICTORS = ["tasminAdjust", "hursmaxAdjust", "hursminAdjust",
               "prtotAdjust", "rsdsAdjust", "sfcWindAdjust"]       # present in both historical and ssp370; target excluded
 TARGET = "tasmaxAdjust"
-DEM_PATH = DATA_DIR / "DEM" / "gebco_2025_n-20.82_s-21.45_w55.15_e55.9.nc"
-GCM_GRID_FILE = DATA_DIR / "CMIP_CNRM_ESM21" / "tas_day_CNRM-ESM2-1_historical_r1i1p1f2_gr_18500101-20141231.nc"
 TEST_YEARS = 5
-MODELS_DIR = Path("models") / "unet_3km"
 
 
-def load_variable(scenario, var):
+def load_variable(aladin_dir, scenario, var):
     import xarray as xr
 
-    files = sorted(glob.glob(str(ALADIN_DIR / scenario / "day" / var / "*.nc")))
+    folder = Path(aladin_dir) / scenario / "day" / var
+    files = sorted(glob.glob(str(folder / "*.nc")))
     if not files:
-        raise FileNotFoundError(f"No files for '{var}' in {ALADIN_DIR / scenario / 'day' / var}")
+        raise FileNotFoundError(f"No files for '{var}' in {folder} (check --data-dir / --aladin-dir and the SSHFS mount)")
 
     parts = []
     for f in files:
@@ -616,10 +651,10 @@ def load_variable(scenario, var):
     return da.transpose("time", "lat", "lon")
 
 
-def load_variable_all(scenarios, var):
+def load_variable_all(aladin_dir, scenarios, var):
     import xarray as xr
 
-    da = xr.concat([load_variable(s, var) for s in scenarios], dim = "time")
+    da = xr.concat([load_variable(aladin_dir, s, var) for s in scenarios], dim = "time")
     _, keep = np.unique(da["time"].values, return_index = True)   # drop duplicated dates at scenario joins, if any
     return da.isel(time = np.sort(keep))
 
@@ -638,7 +673,7 @@ def load_dem(path, lat, lon):
     return dem.values.astype(np.float32)                         # (H, W)
 
 
-def gcm_cells(lat, lon, gcm_grid_file = GCM_GRID_FILE):
+def gcm_cells(lat, lon, gcm_grid_file):
     # Labels each 3 km pixel with the GCM cell that contains it (nearest GCM cell centre = inside its bounds).
     import xarray as xr
 
@@ -663,8 +698,8 @@ def upscale_to_gcm(values, labels, n_cells):
     return out
 
 
-def load_data(scenarios, predictors, target, gcm_grid_file = GCM_GRID_FILE):
-    y_da = load_variable_all(scenarios, target)
+def load_data(aladin_dir, scenarios, predictors, target, gcm_grid_file):
+    y_da = load_variable_all(aladin_dir, scenarios, target)
     lat, lon = y_da["lat"].values, y_da["lon"].values
     labels, centres = gcm_cells(lat, lon, gcm_grid_file)
     first = y_da.values[0].ravel()
@@ -672,7 +707,7 @@ def load_data(scenarios, predictors, target, gcm_grid_file = GCM_GRID_FILE):
 
     upscaled = []                                                # one variable at a time keeps memory low
     for v in predictors:
-        da = load_variable_all(scenarios, v)
+        da = load_variable_all(aladin_dir, scenarios, v)
         up = upscale_to_gcm(da.values.astype(np.float32), labels, len(centres))[:, land_cells]
         upscaled.append((da["time"].values, up, v))
 
@@ -690,6 +725,32 @@ def load_data(scenarios, predictors, target, gcm_grid_file = GCM_GRID_FILE):
     print(f"{'+'.join(scenarios)}: {len(times)} days ({str(times[0])[:10]} -> {str(times[-1])[:10]}) | "
           f"grid {Y.shape[2:]} | GCM cells with land: {len(land_cells)} -> 1D features {features.shape[1]}")
     return features, Y, times, lat, lon, names
+
+
+def load_data_cached(args):
+    # Reading the NetCDF files through SSHFS is slow: the prepared arrays (1D features, target, DEM)
+    # are saved once in --cache-dir on the local disk and reused while the inputs stay the same.
+    key = json.dumps({"aladin_dir": str(args.aladin_dir), "scenarios": args.scenarios, "predictors": args.predictors,
+                      "target": args.target, "gcm_grid_file": str(args.gcm_grid_file), "dem_path": str(args.dem_path)},
+                     sort_keys = True)
+    cache = Path(args.cache_dir) / f"data_{hashlib.sha1(key.encode()).hexdigest()[:12]}.npz" if args.cache_dir else None
+
+    if cache is not None and cache.exists():
+        d = np.load(cache, allow_pickle = False)
+        print(f"Loaded cached data: {cache}")
+        return (d["features"], d["Y"], d["times"], d["lat"], d["lon"], d["names"].tolist(), d["dem"])
+
+    t0 = time.time()
+    features, Y, times, lat, lon, names = load_data(args.aladin_dir, args.scenarios, args.predictors,
+                                                    args.target, args.gcm_grid_file)
+    dem = load_dem(args.dem_path, lat, lon)
+    print(f"Data read in {time.time() - t0:.0f} s")
+    if cache is not None:
+        cache.parent.mkdir(parents = True, exist_ok = True)
+        np.savez(cache, features = features, Y = Y, times = times, lat = lat, lon = lon,
+                 names = np.array(names), dem = dem, key = np.array(key))
+        print(f"Saved cache: {cache}")
+    return features, Y, times, lat, lon, names, dem
 
 
 def time_folds(times, test_years = TEST_YEARS):
@@ -753,17 +814,36 @@ def masked_mse(y_pred, y_true):
     return ((y_pred[mask] - y_true[mask]) ** 2).mean()
 
 
-def run_epoch(model, loader, device, optimizer = None):
+def batches(f, y, idx, batch_size, shuffle = False):
+    # Mini-batches drawn from tensors that already sit on the device (the whole dataset fits in GPU memory),
+    # which avoids a DataLoader copying every batch from the CPU. Training drops the last incomplete batch:
+    # BatchNorm1d needs more than one sample.
+    idx = torch.as_tensor(idx, device = f.device)
+    if shuffle:
+        idx = idx[torch.randperm(len(idx), device = f.device)]
+    stop = len(idx) - (len(idx) % batch_size) if shuffle else len(idx)
+    for i in range(0, stop, batch_size):
+        b = idx[i:i + batch_size]
+        yield f[b], y[b]
+
+
+def run_epoch(model, batch_iter, optimizer = None, amp_dtype = None, scaler = None):
     model.train(optimizer is not None)
     total, n = 0.0, 0
     with torch.set_grad_enabled(optimizer is not None):
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            loss = masked_mse(model(x), y)
+        for x, y in batch_iter:
+            with torch.autocast(device_type = x.device.type, dtype = amp_dtype, enabled = amp_dtype is not None):
+                y_pred = model(x)
+            loss = masked_mse(y_pred.float(), y)
             if optimizer is not None:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                optimizer.zero_grad(set_to_none = True)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
             total += loss.item() * x.shape[0]
             n += x.shape[0]
     return total / n
@@ -779,14 +859,14 @@ def build_model(stats, n_features, dem, device):
 
 
 def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, device):
-    from torch.utils.data import DataLoader, TensorDataset
     import xarray as xr
 
     (y0, y1), k = fold["years"], fold["fold"]
-    out_dir = MODELS_DIR / f"fold_{k:02d}_{y0}-{y1}"
+    out_dir = Path(args.models_dir) / f"fold_{k:02d}_{y0}-{y1}"
     out_dir.mkdir(parents = True, exist_ok = True)
     idx_train, idx_val, idx_test = fold["train"], fold["val"], fold["test"]
     print(f"\n=== Fold {k}: test {y0}-{y1} | train {len(idx_train)} days, val {len(idx_val)}, test {len(idx_test)} ===")
+    seed_everything(args.seed + k)
 
     # Statistics from this fold's training days only
     stats = normalization_stats(features[idx_train], Y[idx_train], dem)
@@ -796,24 +876,23 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
                   "n_features": features.shape[1], "feature_names": names, "fold": k, "test_years": [y0, y1]})
     json.dump(stats, open(out_dir / "normalization_stats.json", "w"), indent = 2)
 
-    f_norm = normalize_features(features, stats)
-    Y_norm = (Y - stats["y_mean"]) / (stats["y_std"] + 1e-8)     # NaN (sea) kept, masked in the loss
-
-    def loader(idx, shuffle):
-        return DataLoader(TensorDataset(torch.from_numpy(f_norm[idx]), torch.from_numpy(Y_norm[idx])),
-                          batch_size = args.batch_size, shuffle = shuffle, drop_last = shuffle)   # BatchNorm1d needs > 1 sample
-    train_loader, val_loader = loader(idx_train, True), loader(idx_val, False)
+    # Whole normalized dataset on the device once (about 160 MB)
+    f_t = torch.from_numpy(normalize_features(features, stats)).to(device)
+    y_t = torch.from_numpy((Y - stats["y_mean"]) / (stats["y_std"] + 1e-8)).to(device)   # NaN (sea) kept, masked in the loss
 
     model = build_model(stats, features.shape[1], dem, device)
     optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor = 0.5, patience = 7)
+    amp_dtype, scaler = amp_settings(args.amp, device)
 
     best_val, epochs_without_improvement = float("inf"), 0
     for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(model, train_loader, device, optimizer)
-        val_loss = run_epoch(model, val_loader, device)
+        t0 = time.time()
+        train_loss = run_epoch(model, batches(f_t, y_t, idx_train, args.batch_size, shuffle = True),
+                               optimizer, amp_dtype, scaler)
+        val_loss = run_epoch(model, batches(f_t, y_t, idx_val, args.eval_batch_size), amp_dtype = amp_dtype)
         scheduler.step(val_loss)
-        print(f"Fold {k} | epoch {epoch:3d} | train MSE {train_loss:.4f} | val MSE {val_loss:.4f}")
+        print(f"Fold {k} | epoch {epoch:3d} | train MSE {train_loss:.4f} | val MSE {val_loss:.4f} | {time.time() - t0:.0f} s")
 
         if val_loss < best_val:
             best_val, epochs_without_improvement = val_loss, 0
@@ -829,8 +908,8 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
     model.eval()
     preds = []
     with torch.no_grad():
-        for i in range(0, len(idx_test), 256):
-            preds.append(model(torch.from_numpy(f_norm[idx_test[i:i + 256]]).to(device)).cpu().numpy())
+        for x, _ in batches(f_t, y_t, idx_test, args.eval_batch_size):
+            preds.append(model(x).float().cpu().numpy())
     pred = np.concatenate(preds)[:, 0] * stats["y_std"] + stats["y_mean"]
     pred = np.where(land_mask[None], pred, np.nan).astype(np.float32)
 
@@ -845,16 +924,20 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
                  name = args.target).to_netcdf(out_dir / f"{args.target}_pred_{y0}-{y1}.nc")
     print(f"Fold {k} | test {y0}-{y1}: RMSE {metrics['test_rmse']:.3f} | MAE {metrics['test_mae']:.3f} | "
           f"bias {metrics['test_bias']:+.3f} (target units)")
+    del f_t, y_t
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return metrics
 
 
-def write_cv_summary():
+def write_cv_summary(models_dir):
     # Collects metrics.json of every fold trained so far into cv_summary.csv
-    rows = [json.load(open(p)) for p in sorted(MODELS_DIR.glob("fold_*/metrics.json"))]
+    models_dir = Path(models_dir)
+    rows = [json.load(open(p)) for p in sorted(models_dir.glob("fold_*/metrics.json"))]
     if not rows:
         return
     keys = list(rows[0].keys())
-    with open(MODELS_DIR / "cv_summary.csv", "w") as f:
+    with open(models_dir / "cv_summary.csv", "w") as f:
         f.write(",".join(keys) + "\n")
         for r in rows:
             f.write(",".join(str(r[c]) for c in keys) + "\n")
@@ -862,41 +945,128 @@ def write_cv_summary():
     pooled_rmse = np.sqrt(np.sum(n * np.array([r["test_rmse"] for r in rows]) ** 2) / n.sum())
     print(f"\nCV summary ({len(rows)} folds): pooled test RMSE {pooled_rmse:.3f} | "
           f"per fold min {min(r['test_rmse'] for r in rows):.3f}, max {max(r['test_rmse'] for r in rows):.3f} "
-          f"| {MODELS_DIR / 'cv_summary.csv'}")
+          f"| {models_dir / 'cv_summary.csv'}")
+
+
+# ---------------------------------------------------------------- machine settings
+
+def get_device(name):
+    # "auto" -> first CUDA GPU, then Apple MPS, then CPU. Also accepts "cuda", "cuda:1", "mps", "cpu".
+    if name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    device = torch.device(name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"--device {name} requested but CUDA is not available (torch {torch.__version__}, "
+                           f"built for CUDA {torch.version.cuda})")
+    if device.type == "cuda" and device.index is not None and device.index >= torch.cuda.device_count():
+        raise RuntimeError(f"--device {name}: only {torch.cuda.device_count()} GPU(s) visible")
+    return device
+
+
+def amp_settings(enabled, device):
+    # Mixed precision on GPU: bfloat16 when supported (no gradient scaling needed), else float16 with a GradScaler
+    if not enabled or device.type != "cuda":
+        return None, None
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16, None
+    return torch.float16, torch.amp.GradScaler("cuda")
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)          # also seeds every CUDA device
+
+
+def resolve_paths(args):
+    data_dir = Path(args.data_dir).expanduser()
+    args.data_dir = data_dir
+    args.aladin_dir = Path(args.aladin_dir).expanduser() if args.aladin_dir else data_dir / ALADIN_SUBDIR
+    args.dem_path = Path(args.dem_path).expanduser() if args.dem_path else data_dir / DEM_SUBPATH
+    args.gcm_grid_file = Path(args.gcm_grid_file).expanduser() if args.gcm_grid_file else data_dir / GCM_GRID_SUBPATH
+    args.models_dir = Path(args.models_dir).expanduser()
+    args.cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
+
+    missing = [f"{name}: {p}" for name, p in (("data dir", data_dir), ("ALADIN dir", args.aladin_dir),
+                                               ("DEM", args.dem_path), ("GCM grid file", args.gcm_grid_file))
+               if not p.exists()]
+    if missing:
+        raise FileNotFoundError("Not found (is the NAS mounted? see --data-dir):\n  " + "\n  ".join(missing))
+    return args
 
 
 def train(args):
-    MODELS_DIR.mkdir(parents = True, exist_ok = True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args = resolve_paths(args)
+    device = get_device(args.device)
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True                   # fixed input size: let cuDNN pick the fastest kernels
+    args.models_dir.mkdir(parents = True, exist_ok = True)
 
-    features, Y, times, lat, lon, names = load_data(args.scenarios, args.predictors, args.target)
-    dem = load_dem(args.dem_path, lat, lon)
+    gpu = f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""
+    print(f"Host {platform.node()} | torch {torch.__version__} | device {device}{gpu} | CPU threads {torch.get_num_threads()}"
+          f" | AMP {'on' if amp_settings(args.amp, device)[0] is not None else 'off'}")
+    print(f"Data {args.data_dir} | models {args.models_dir} | cache {args.cache_dir or 'off'}")
+    config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+    config.update({"host": platform.node(), "torch": torch.__version__, "device_used": str(device) + gpu,
+                   "started": time.strftime("%Y-%m-%d %H:%M:%S")})
+    json.dump(config, open(args.models_dir / "run_config.json", "w"), indent = 2)
+
+    features, Y, times, lat, lon, names, dem = load_data_cached(args)
     land_mask = ~np.isnan(Y[0, 0])
-    np.save(MODELS_DIR / "land_mask.npy", land_mask)
-    print(f"DEM {dem.shape}: {dem.min():.0f}-{dem.max():.0f} m | land pixels: {land_mask.sum()}/{land_mask.size} | device: {device}")
+    np.save(args.models_dir / "land_mask.npy", land_mask)
+    print(f"DEM {dem.shape}: {dem.min():.0f}-{dem.max():.0f} m | land pixels: {land_mask.sum()}/{land_mask.size}")
 
     folds = time_folds(times, args.test_years)
     print("Folds: " + ", ".join(f"{f['fold']}:{f['years'][0]}-{f['years'][1]}" for f in folds))
+    if args.dry_run:
+        print("Dry run: data and folds OK, no training.")
+        return
     selected = folds if args.folds is None else [folds[k] for k in args.folds]
 
     for fold in selected:
         train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, device)
-    write_cv_summary()
+    write_cv_summary(args.models_dir)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description = "UNET: GCM-grid (1.4 deg) predictors + DEM -> 3 km, blocked time cross-validation")
-    parser.add_argument("--scenarios", nargs = "+", default = SCENARIOS, help = "joined in time for training")
-    parser.add_argument("--test-years", type = int, default = TEST_YEARS, help = "length of each test block")
-    parser.add_argument("--folds", type = int, nargs = "+", default = None, help = "fold indices to run (default: all)")
-    parser.add_argument("--predictors", nargs = "+", default = PREDICTORS)
-    parser.add_argument("--target", default = TARGET)
-    parser.add_argument("--dem-path", default = DEM_PATH)
-    parser.add_argument("--base-channels", type = int, default = 32)
-    parser.add_argument("--dense-neurons", type = int, nargs = "+", default = [64, 128, 256], help = "InputBlock1D layers")
-    parser.add_argument("--dropout", type = float, default = 0.)
-    parser.add_argument("--batch-size", type = int, default = 16)
-    parser.add_argument("--lr", type = float, default = 1e-4)
-    parser.add_argument("--epochs", type = int, default = 75)
-    parser.add_argument("--patience", type = int, default = 15)
+    env = os.environ.get
+    parser = argparse.ArgumentParser(description = "UNET: GCM-grid (1.4 deg) predictors + DEM -> 3 km, blocked time cross-validation",
+                                     formatter_class = argparse.ArgumentDefaultsHelpFormatter)
+    paths = parser.add_argument_group("paths (flag > environment variable > default)")
+    paths.add_argument("--data-dir", default = env("UNET_DATA_DIR", DEFAULT_DATA_DIR), help = "NAS data root, e.g. the SSHFS mount point [UNET_DATA_DIR]")
+    paths.add_argument("--aladin-dir", default = None, help = f"default: <data-dir>/{ALADIN_SUBDIR}")
+    paths.add_argument("--dem-path", default = None, help = f"default: <data-dir>/{DEM_SUBPATH}")
+    paths.add_argument("--gcm-grid-file", default = None, help = f"default: <data-dir>/{GCM_GRID_SUBPATH}")
+    paths.add_argument("--models-dir", default = env("UNET_MODELS_DIR", DEFAULT_MODELS_DIR), help = "outputs; prefer a local disk [UNET_MODELS_DIR]")
+    paths.add_argument("--cache-dir", default = env("UNET_CACHE_DIR", DEFAULT_CACHE_DIR), help = "local cache of the prepared arrays, '' = off [UNET_CACHE_DIR]")
+
+    machine = parser.add_argument_group("machine")
+    machine.add_argument("--device", default = env("UNET_DEVICE", DEFAULT_DEVICE), help = "auto, cuda, cuda:1, mps or cpu [UNET_DEVICE]")
+    machine.add_argument("--threads", type = int, default = int(env("UNET_THREADS", "0")), help = "CPU threads for torch, 0 = torch default [UNET_THREADS]")
+    machine.add_argument("--amp", action = "store_true", help = "mixed precision on GPU (faster, bfloat16 when supported)")
+    machine.add_argument("--seed", type = int, default = 42)
+    machine.add_argument("--dry-run", action = "store_true", help = "check paths, read data and list folds, then stop")
+
+    exp = parser.add_argument_group("experiment")
+    exp.add_argument("--scenarios", nargs = "+", default = SCENARIOS, help = "joined in time for training")
+    exp.add_argument("--test-years", type = int, default = TEST_YEARS, help = "length of each test block")
+    exp.add_argument("--folds", type = int, nargs = "+", default = None, help = "fold indices to run (default: all)")
+    exp.add_argument("--predictors", nargs = "+", default = PREDICTORS)
+    exp.add_argument("--target", default = TARGET)
+
+    model = parser.add_argument_group("model and training")
+    model.add_argument("--base-channels", type = int, default = 32)
+    model.add_argument("--dense-neurons", type = int, nargs = "+", default = [64, 128, 256], help = "InputBlock1D layers")
+    model.add_argument("--dropout", type = float, default = 0.)
+    model.add_argument("--batch-size", type = int, default = 16)
+    model.add_argument("--eval-batch-size", type = int, default = 256)
+    model.add_argument("--lr", type = float, default = 1e-4)
+    model.add_argument("--epochs", type = int, default = 75)
+    model.add_argument("--patience", type = int, default = 15)
     train(parser.parse_args())
