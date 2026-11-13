@@ -36,11 +36,18 @@ Architecture (default: 32 base channels, 4 blocks)
 Training and evaluation
 -----------------------
   historical (1981-2014) and ssp370 (2015-2100) are joined into one daily series.
-  Blocked time cross-validation: the series is cut into consecutive 5-year blocks
-  (1981-1985, ..., 2096-2100: 24 folds). In each fold one block is the test set, the
-  block before it (after it for the first fold) is the validation set for early stopping,
-  and all other days are training data. Normalization statistics come from the fold's
-  training days only. Loss: masked MSE on land pixels.
+  Fixed test set, the same for every fold and never seen in training or early stopping:
+    2011-2014 (end of historical), 2046-2050 (mid-century), 2096-2100 (end of century).
+  10-fold cross-validation on the remaining 106 years, without any year repeated:
+    historical (1981-2010, 30 years = 28.3 % of the non-test data) -> 10 groups of 3 years
+    projection (2015-2045 and 2051-2095, 76 years = 71.7 %)        -> 10 groups of 7-8 years
+      (4 groups in 2015-2045, 6 in 2051-2095: no group straddles a test period)
+  The validation set of fold k = historical group k + projection group k (about 10.6 years,
+  28 % / 72 %, the same mix as the data). Every non-test year is a validation year exactly
+  once. All other non-test days are the fold's training set (about 35,000 days). Every fold
+  is scored on the same test set, and the mean of the folds' predictions (ensemble) is
+  scored too. Normalization statistics come from the fold's training days only.
+  Loss: masked MSE on land pixels.
 
 Data (under --data-dir, default /mnt/nas/Data)
 ----------------------------------------------
@@ -52,9 +59,10 @@ Data (under --data-dir, default /mnt/nas/Data)
 
 Usage
 -----
-  python UNET.py                          # all 24 folds
-  python UNET.py --folds 0 23             # only some folds (indices printed at start)
-  python UNET.py --test-years 10 --target tasminAdjust --batch-size 64
+  python UNET.py                          # all 10 folds
+  python UNET.py --folds 0 5 9            # only some folds (indices printed at start)
+  python UNET.py --test-periods 2011-2014 2046-2050 2096-2100 --n-folds 10
+  python UNET.py --target tasminAdjust --batch-size 64
   python UNET.py --help                   # every option with its default
 
 Running on another machine (e.g. a GPU server with the NAS mounted through SSHFS)
@@ -90,6 +98,8 @@ Known limitations
   - ssp370 files mix ALADIN63 and ALADIN64 runs (see file names).
   - Neighbouring blocks share a boundary: the last days of one block and the first days of
     the next are correlated (weather persists a few days). Small effect with 5-year blocks.
+  - Training years surround each test period (e.g. 2010 and 2015 around 2011-2014), so the
+    test periods are interpolation in time, not extrapolation beyond the training climate.
   - ContractiveBlock loop in UNET.__init__: block 0 is built then overwritten by the
     `else` branch, so it does not use replicate padding.
   - DoubleResolutionLayer ignores `output_padding`; ExpansiveBlock does not pass
@@ -103,6 +113,7 @@ import json
 import os
 import platform
 import random
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -631,7 +642,9 @@ SCENARIOS = ["historical", "ssp370"]
 PREDICTORS = ["tasminAdjust", "hursmaxAdjust", "hursminAdjust",
               "prtotAdjust", "rsdsAdjust", "sfcWindAdjust"]       # present in both historical and ssp370; target excluded
 TARGET = "tasmaxAdjust"
-TEST_YEARS = 5
+TEST_PERIODS = ["2011-2014", "2046-2050", "2096-2100"]   # fixed test set, the same for every fold
+N_FOLDS = 10                                              # cross-validation folds; each non-test year validates once
+PROJECTION_START = 2015                                   # first year of the scenario part (historical before it)
 
 
 def load_variable(aladin_dir, scenario, var):
@@ -753,19 +766,83 @@ def load_data_cached(args):
     return features, Y, times, lat, lon, names, dem
 
 
-def time_folds(times, test_years = TEST_YEARS):
-    # Blocked time cross-validation: consecutive test_years blocks; each block is the test set once,
-    # the block before it (after it, for the first) is the validation set for early stopping, the rest is training.
-    years = times.astype("datetime64[Y]").astype(int) + 1970
-    starts = np.arange(years.min(), years.max() + 1, test_years)
-    blocks = [np.where((years >= s) & (years < s + test_years))[0] for s in starts]
+def parse_periods(specs):
+    # ["2011-2014", "2046-2050"] -> [(2011, 2014), (2046, 2050)]
+    periods = []
+    for p in specs:
+        y0, y1 = (int(v) for v in str(p).split("-"))
+        periods.append((min(y0, y1), max(y0, y1)))
+    return periods
+
+
+def years_of(times):
+    return times.astype("datetime64[Y]").astype(int) + 1970
+
+
+def split_years(years, n_folds):
+    # Splits a set of years into n_folds groups of consecutive years, as equal as possible.
+    # Stretches separated by a test period are split separately (no group straddles a test period);
+    # the folds are shared between stretches in proportion to their length (largest remainder).
+    years = np.unique(years)
+    if len(years) < n_folds:
+        raise ValueError(f"{len(years)} years cannot be split into {n_folds} folds")
+    segments = np.split(years, np.where(np.diff(years) > 1)[0] + 1)
+    quota = np.array([len(seg) for seg in segments]) * n_folds / len(years)
+    counts = np.floor(quota).astype(int)
+    for i in np.argsort(-(quota - counts))[:n_folds - counts.sum()]:
+        counts[i] += 1
+    groups = []
+    for seg, c in zip(segments, counts):
+        groups += [g for g in np.array_split(seg, c) if len(g)] if c > 0 else []
+    if len(groups) != n_folds:               # very short stretch got no fold: fall back to one sequence
+        groups = np.array_split(years, n_folds)
+    return groups
+
+
+def time_folds(times, test_periods, n_folds = N_FOLDS, projection_start = PROJECTION_START):
+    # Fixed test set: every day inside test_periods, never used for training or early stopping.
+    # k-fold cross-validation on the remaining years: the historical part (< projection_start) and the
+    # projection part are each split into n_folds groups of consecutive years. The validation set of fold k
+    # = historical group k + projection group k, so each validation set holds both parts in the same
+    # proportion as the data (about 28 % / 72 %), and every non-test year is validated exactly once.
+    # All other non-test days are the fold's training set.
+    years = years_of(times)
+    is_test = np.zeros(len(times), dtype = bool)
+    for y0, y1 in test_periods:
+        is_test |= (years >= y0) & (years <= y1)
+    test = np.where(is_test)[0]
+
+    parts = [years[~is_test & (years < projection_start)], years[~is_test & (years >= projection_start)]]
+    groups = [split_years(p, n_folds) for p in parts if len(p)]  # one part only -> plain k-fold
+
+    shares = [len(p) / (~is_test).sum() for p in parts]
+    print(f"Non-test days: historical {shares[0]:.1%} | projection {shares[1]:.1%}")
+
     folds = []
-    for k, test in enumerate(blocks):
-        val = blocks[k - 1] if k > 0 else blocks[k + 1]
-        train = np.setdiff1d(np.arange(len(times)), np.concatenate([test, val]))
-        folds.append({"fold": k, "years": (int(years[test].min()), int(years[test].max())),
-                      "train": train, "val": val, "test": test})
+    for k in range(n_folds):
+        chosen = [g[k] for g in groups]
+        in_val = np.isin(years, np.concatenate(chosen)) & ~is_test
+        folds.append({"fold": k, "val_blocks": [(int(c[0]), int(c[-1])) for c in chosen],
+                      "train": np.where(~is_test & ~in_val)[0], "val": np.where(in_val)[0], "test": test})
     return folds
+
+
+def blocks_label(blocks, sep = "+"):
+    return sep.join(f"{a}-{b}" for a, b in blocks)
+
+
+def score(pred, truth, times, test_periods):
+    # RMSE / MAE / bias on land pixels (NaN in truth = sea), for the whole test set and for each test period
+    def metrics(d):
+        return {"rmse": float(np.sqrt(np.nanmean(d ** 2))), "mae": float(np.nanmean(np.abs(d))),
+                "bias": float(np.nanmean(d)), "n_scored": int(np.isfinite(d).sum())}
+    diff = pred - truth
+    years = years_of(times)
+    out = {f"{k}_all": v for k, v in metrics(diff).items()}
+    for y0, y1 in test_periods:
+        sel = (years >= y0) & (years <= y1)
+        out.update({f"{k}_{y0}-{y1}": v for k, v in metrics(diff[sel]).items() if k != "n_scored"})
+    return out
 
 
 def normalization_stats(features, Y, dem):
@@ -861,11 +938,12 @@ def build_model(stats, n_features, dem, device):
 def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, device):
     import xarray as xr
 
-    (y0, y1), k = fold["years"], fold["fold"]
-    out_dir = Path(args.models_dir) / f"fold_{k:02d}_{y0}-{y1}"
+    val_label, k = blocks_label(fold["val_blocks"]), fold["fold"]
+    out_dir = Path(args.models_dir) / f"fold_{k:02d}_val{val_label}"
     out_dir.mkdir(parents = True, exist_ok = True)
     idx_train, idx_val, idx_test = fold["train"], fold["val"], fold["test"]
-    print(f"\n=== Fold {k}: test {y0}-{y1} | train {len(idx_train)} days, val {len(idx_val)}, test {len(idx_test)} ===")
+    print(f"\n=== Fold {k}: validation {blocks_label(fold['val_blocks'], ' + ')} | train {len(idx_train)} days, val {len(idx_val)}, "
+          f"test {len(idx_test)} (fixed) ===")
     seed_everything(args.seed + k)
 
     # Statistics from this fold's training days only
@@ -873,7 +951,8 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
     stats.update({"predictors": args.predictors, "target": args.target, "scenarios": args.scenarios,
                   "dem_path": str(args.dem_path), "base_channels": args.base_channels,
                   "dense_neurons": args.dense_neurons, "dropout": args.dropout,
-                  "n_features": features.shape[1], "feature_names": names, "fold": k, "test_years": [y0, y1]})
+                  "n_features": features.shape[1], "feature_names": names, "fold": k,
+                  "val_blocks": blocks_label(fold["val_blocks"]), "test_periods": [f"{a}-{b}" for a, b in args.test_periods]})
     json.dump(stats, open(out_dir / "normalization_stats.json", "w"), indent = 2)
 
     # Whole normalized dataset on the device once (about 160 MB)
@@ -913,39 +992,58 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
     pred = np.concatenate(preds)[:, 0] * stats["y_std"] + stats["y_mean"]
     pred = np.where(land_mask[None], pred, np.nan).astype(np.float32)
 
-    diff = pred - Y[idx_test, 0]
-    metrics = {"fold": k, "test_start": y0, "test_end": y1, "n_train": len(idx_train), "n_test": len(idx_test),
-               "best_val_mse_norm": best_val, "test_rmse": float(np.sqrt(np.nanmean(diff ** 2))),
-               "test_mae": float(np.nanmean(np.abs(diff))), "test_bias": float(np.nanmean(diff)),
-               "n_scored": int(np.isfinite(diff).sum())}
+    metrics = {"fold": k, "val_blocks": val_label, "n_train": len(idx_train), "n_val": len(idx_val),
+               "n_test": len(idx_test), "best_val_mse_norm": best_val}
+    metrics.update(score(pred, Y[idx_test, 0], times[idx_test], args.test_periods))
     json.dump(metrics, open(out_dir / "metrics.json", "w"), indent = 2)
 
     xr.DataArray(pred, dims = ("time", "lat", "lon"), coords = {"time": times[idx_test], "lat": lat, "lon": lon},
-                 name = args.target).to_netcdf(out_dir / f"{args.target}_pred_{y0}-{y1}.nc")
-    print(f"Fold {k} | test {y0}-{y1}: RMSE {metrics['test_rmse']:.3f} | MAE {metrics['test_mae']:.3f} | "
-          f"bias {metrics['test_bias']:+.3f} (target units)")
+                 name = args.target).to_netcdf(out_dir / f"{args.target}_test_pred.nc")
+    print(f"Fold {k} | test set: RMSE {metrics['rmse_all']:.3f} | MAE {metrics['mae_all']:.3f} | "
+          f"bias {metrics['bias_all']:+.3f} | " +
+          " | ".join(f"{a}-{b} RMSE {metrics[f'rmse_{a}-{b}']:.3f}" for a, b in args.test_periods))
     del f_t, y_t
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return metrics
 
 
-def write_cv_summary(models_dir):
-    # Collects metrics.json of every fold trained so far into cv_summary.csv
+def write_cv_summary(models_dir, target, Y_test, test_times, test_periods):
+    # cv_summary.csv: the metrics of every fold trained so far in models_dir (all scored on the same test set),
+    # plus the ensemble: the mean of the folds' test predictions, saved and scored as well.
+    import xarray as xr
+
     models_dir = Path(models_dir)
     rows = [json.load(open(p)) for p in sorted(models_dir.glob("fold_*/metrics.json"))]
+    rows = [r for r in rows if "rmse_all" in r and "val_blocks" in r]       # ignore folds from older setups
     if not rows:
         return
     keys = list(rows[0].keys())
     with open(models_dir / "cv_summary.csv", "w") as f:
         f.write(",".join(keys) + "\n")
         for r in rows:
-            f.write(",".join(str(r[c]) for c in keys) + "\n")
-    n = np.array([r["n_scored"] for r in rows])
-    pooled_rmse = np.sqrt(np.sum(n * np.array([r["test_rmse"] for r in rows]) ** 2) / n.sum())
-    print(f"\nCV summary ({len(rows)} folds): pooled test RMSE {pooled_rmse:.3f} | "
-          f"per fold min {min(r['test_rmse'] for r in rows):.3f}, max {max(r['test_rmse'] for r in rows):.3f} "
-          f"| {models_dir / 'cv_summary.csv'}")
+            f.write(",".join(str(r.get(c, "")) for c in keys) + "\n")
+    rmse = np.array([r["rmse_all"] for r in rows])
+    print(f"\nCV summary ({len(rows)} folds, same test set): test RMSE mean {rmse.mean():.3f} +/- {rmse.std():.3f} "
+          f"(min {rmse.min():.3f}, max {rmse.max():.3f}) | {models_dir / 'cv_summary.csv'}")
+
+    preds = []
+    for p in sorted(models_dir.glob(f"fold_*/{target}_test_pred.nc")):
+        with xr.open_dataarray(p) as da:
+            if not np.array_equal(da["time"].values, test_times):
+                print(f"Skipped in the ensemble (different test days, older run?): {p}")
+                continue
+            preds.append(da.values)
+    if not preds:
+        return
+    ensemble = np.mean(preds, axis = 0).astype(np.float32)
+    ens_metrics = {"n_folds": len(preds), **score(ensemble, Y_test, test_times, test_periods)}
+    json.dump(ens_metrics, open(models_dir / "ensemble_metrics.json", "w"), indent = 2)
+    with xr.open_dataarray(sorted(models_dir.glob(f"fold_*/{target}_test_pred.nc"))[0]) as ref:
+        ref.copy(data = ensemble).to_netcdf(models_dir / f"{target}_test_pred_ensemble.nc")
+    print(f"Ensemble of {len(preds)} folds: test RMSE {ens_metrics['rmse_all']:.3f} | MAE {ens_metrics['mae_all']:.3f} | "
+          f"bias {ens_metrics['bias_all']:+.3f} | " +
+          " | ".join(f"{a}-{b} RMSE {ens_metrics[f'rmse_{a}-{b}']:.3f}" for a, b in test_periods))
 
 
 # ---------------------------------------------------------------- machine settings
@@ -1001,6 +1099,8 @@ def resolve_paths(args):
 
 def train(args):
     args = resolve_paths(args)
+    if args.seed < 0:                                            # fresh random seed for this run, recorded in run_config.json
+        args.seed = int.from_bytes(os.urandom(4), "little") % 2**31
     device = get_device(args.device)
     if args.threads > 0:
         torch.set_num_threads(args.threads)
@@ -1010,7 +1110,7 @@ def train(args):
 
     gpu = f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""
     print(f"Host {platform.node()} | torch {torch.__version__} | device {device}{gpu} | CPU threads {torch.get_num_threads()}"
-          f" | AMP {'on' if amp_settings(args.amp, device)[0] is not None else 'off'}")
+          f" | AMP {'on' if amp_settings(args.amp, device)[0] is not None else 'off'} | seed {args.seed}")
     print(f"Data {args.data_dir} | models {args.models_dir} | cache {args.cache_dir or 'off'}")
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
     config.update({"host": platform.node(), "torch": torch.__version__, "device_used": str(device) + gpu,
@@ -1022,8 +1122,13 @@ def train(args):
     np.save(args.models_dir / "land_mask.npy", land_mask)
     print(f"DEM {dem.shape}: {dem.min():.0f}-{dem.max():.0f} m | land pixels: {land_mask.sum()}/{land_mask.size}")
 
-    folds = time_folds(times, args.test_years)
-    print("Folds: " + ", ".join(f"{f['fold']}:{f['years'][0]}-{f['years'][1]}" for f in folds))
+    args.test_periods = parse_periods(args.test_periods)
+    folds = time_folds(times, args.test_periods, args.n_folds, args.projection_start)
+    if len(folds[0]["test"]) == 0:
+        raise ValueError(f"No days inside the test periods {args.test_periods}")
+    print(f"Test set (fixed): {', '.join(f'{a}-{b}' for a, b in args.test_periods)} -> {len(folds[0]['test'])} days")
+    print("Folds (validation = historical years + projection years):\n  " +
+          "\n  ".join(f"{f['fold']:2d}: {blocks_label(f['val_blocks'], ' + ')}" for f in folds))
     if args.dry_run:
         print("Dry run: data and folds OK, no training.")
         return
@@ -1031,10 +1136,13 @@ def train(args):
 
     for fold in selected:
         train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, device)
-    write_cv_summary(args.models_dir)
+    test = folds[0]["test"]
+    write_cv_summary(args.models_dir, args.target, Y[test, 0], times[test], args.test_periods)
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(line_buffering = True)              # write each line to train.log at once under nohup
+    sys.stderr.reconfigure(line_buffering = True)
     env = os.environ.get
     parser = argparse.ArgumentParser(description = "UNET: GCM-grid (1.4 deg) predictors + DEM -> 3 km, blocked time cross-validation",
                                      formatter_class = argparse.ArgumentDefaultsHelpFormatter)
@@ -1050,12 +1158,17 @@ if __name__ == "__main__":
     machine.add_argument("--device", default = env("UNET_DEVICE", DEFAULT_DEVICE), help = "auto, cuda, cuda:1, mps or cpu [UNET_DEVICE]")
     machine.add_argument("--threads", type = int, default = int(env("UNET_THREADS", "0")), help = "CPU threads for torch, 0 = torch default [UNET_THREADS]")
     machine.add_argument("--amp", action = "store_true", help = "mixed precision on GPU (faster, bfloat16 when supported)")
-    machine.add_argument("--seed", type = int, default = 42)
+    machine.add_argument("--seed", type = int, default = 42,
+                         help = "seeds the shuffling of the training days (new order every epoch) and the weights; "
+                                "-1 = different random seed for every run")
     machine.add_argument("--dry-run", action = "store_true", help = "check paths, read data and list folds, then stop")
 
     exp = parser.add_argument_group("experiment")
     exp.add_argument("--scenarios", nargs = "+", default = SCENARIOS, help = "joined in time for training")
-    exp.add_argument("--test-years", type = int, default = TEST_YEARS, help = "length of each test block")
+    exp.add_argument("--test-periods", nargs = "+", default = TEST_PERIODS, help = "fixed test set, years as START-END")
+    exp.add_argument("--n-folds", type = int, default = N_FOLDS, help = "number of cross-validation folds")
+    exp.add_argument("--projection-start", type = int, default = PROJECTION_START,
+                     help = "first projection year; each validation set takes years before and after it")
     exp.add_argument("--folds", type = int, nargs = "+", default = None, help = "fold indices to run (default: all)")
     exp.add_argument("--predictors", nargs = "+", default = PREDICTORS)
     exp.add_argument("--target", default = TARGET)
