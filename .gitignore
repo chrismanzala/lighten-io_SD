@@ -1,2 +1,2 @@
-*.zip
-outputs_server_tas_tempin_v2.zip
+#data/*
+models/*
