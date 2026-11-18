@@ -103,6 +103,7 @@ def load(args):
     predictors = [v for v in predictors if v != args.target]          # the target is never its own predictor
     print(f"Target {args.target} | candidate predictors: {', '.join(predictors)}")
     ns = argparse.Namespace(data_dir = args.data_dir, aladin_dir = args.aladin_dir, dem_path = args.dem_path,
+                            land_frac_path = getattr(args, "land_frac_path", None),
                             gcm_grid_file = args.gcm_grid_file, models_dir = args.out, cache_dir = args.cache_dir,
                             scenarios = args.scenarios, predictors = predictors, target = args.target)
     ns = UNET.resolve_paths(ns)
@@ -763,6 +764,7 @@ if __name__ == "__main__":
     paths.add_argument("--data-dir", default = env("UNET_DATA_DIR", UNET.DEFAULT_DATA_DIR))
     paths.add_argument("--aladin-dir", default = None)
     paths.add_argument("--dem-path", default = None)
+    paths.add_argument("--land-frac-path", default = None)
     paths.add_argument("--gcm-grid-file", default = None)
     paths.add_argument("--cache-dir", default = env("UNET_CACHE_DIR", UNET.DEFAULT_CACHE_DIR),
                        help = "UNET.py cache of prepared arrays, '' = off")

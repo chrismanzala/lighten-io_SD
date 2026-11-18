@@ -17,7 +17,8 @@ Inputs / output
              model knows the season; 31 December and 1 January are neighbours. Goes through
              InputBlock1D (dense stack) and is copied to every bottleneck pixel. --no-seasonal
              leaves it out.
-  2D input : static DEM (GEBCO, averaged onto the 3 km grid, sea = 0 m), one channel.
+  2D input : static DEM (GEBCO land points only, averaged onto the 3 km grid; every sea pixel of
+             DEM/fracLand_REUNION.nc (0 = sea, 1 = land) set to 0 m), one channel.
              Goes through InputBlock2D and the skip connections.
   output   : target variable on the 3 km grid, (N, 1, H, W).
 
@@ -69,7 +70,8 @@ Data (under --data-dir, default /mnt/nas/Data)
 ----------------------------------------------
   METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE/{historical,ssp370}/day/{var}/*.nc
   CMIP_CNRM_ESM21/historical/tas_day_*.nc   (only its lat/lon: the GCM grid)
-  DEM/gebco_2025_*.nc                       (DEM, variable "elevation")
+  DEM/gebco_2025_*.nc                       (DEM, variable "elevation"; negative over the sea)
+  DEM/fracLand_REUNION.nc                   (land mask, variable "fracLand": 0 sea, 1 land)
   Predictors: tasmin, hursmax, hursmin, rsds (the *Adjust variables, see PREDICTORS);
   default target: tasmaxAdjust (not among the predictors).
 
@@ -693,9 +695,10 @@ DEFAULT_DATA_DIR = "/mnt/nas/Data"                                       # --dat
 DEFAULT_MODELS_DIR = "models/unet_3km"                                   # --models-dir  | UNET_MODELS_DIR
 DEFAULT_CACHE_DIR = ""                                                   # --cache-dir   | UNET_CACHE_DIR ("" = no cache)
 DEFAULT_DEVICE = "auto"                                                  # --device      | UNET_DEVICE
-# Locations inside the data directory (override the full path with --aladin-dir, --dem-path, --gcm-grid-file)
+# Locations inside the data directory (override the full path with --aladin-dir, --dem-path, --land-frac-path, --gcm-grid-file)
 ALADIN_SUBDIR = "METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE"  # {scenario}/day/{var}/*.nc
 DEM_SUBPATH = "DEM/gebco_2025_n-20.82_s-21.45_w55.15_e55.9.nc"
+LAND_FRAC_SUBPATH = "DEM/fracLand_REUNION.nc"                            # fracLand: 0 sea, 1 land (3 km grid)
 GCM_GRID_SUBPATH = "CMIP_CNRM_ESM21/historical/tas_day_CNRM-ESM2-1_historical_r1i1p1f2_gr_18500101-20141231.nc"
 
 SCENARIOS = ["historical", "ssp370"]
@@ -731,18 +734,44 @@ def load_variable_all(aladin_dir, scenarios, var):
     return da.isel(time = np.sort(keep))
 
 
-def load_dem(path, lat, lon):
-    # Averages the ~450 m GEBCO elevation over one 3 km cell, samples it at the grid centres,
-    # and puts sea (<= 0 m) and cells outside the DEM extent at 0 m.
+def load_land_frac(path, lat, lon):
+    # Land/sea mask on the 3 km grid from fracLand (0 = sea, 1 = land). Must be on the same grid as ALADIN.
+    import xarray as xr
+
+    with xr.open_dataset(path) as ds:
+        frac = ds["fracLand"].load()
+    if frac.shape != (len(lat), len(lon)) or not (np.allclose(frac["lat"].values, lat, atol = 1e-4)
+                                                  and np.allclose(frac["lon"].values, lon, atol = 1e-4)):
+        frac = frac.interp(lat = lat, lon = lon, method = "nearest")
+    return np.nan_to_num(frac.values) > 0.5                     # (H, W) bool, True = land
+
+
+def load_dem(path, lat, lon, land_frac_path = None):
+    # GEBCO (~450 m) -> 3 km grid. GEBCO is negative over the sea (bathymetry): only land elevations are kept.
+    #   1. each 3 km pixel = mean of the GEBCO points > 0 m inside it (cell = centre +- half the grid step),
+    #      so a coastal pixel is not pulled down by the sea floor; no GEBCO land point inside -> 0 m
+    #   2. with land_frac_path (fracLand: 0 sea, 1 land), every sea pixel is set to 0 m
+    #   Pixels outside the DEM extent are 0 m.
     import xarray as xr
 
     with xr.open_dataset(path) as ds:
         dem = ds["elevation"].load()
-    window = {d: max(1, int(round(abs(float(c[1] - c[0])) / abs(float(dem[d][1] - dem[d][0])))))
-              for d, c in (("lat", lat), ("lon", lon))}
-    dem = dem.rolling(window, center = True, min_periods = 1).mean()
-    dem = dem.interp(lat = lat, lon = lon).clip(min = 0).fillna(0)
-    return dem.values.astype(np.float32)                         # (H, W)
+    g_lat, g_lon, z = dem["lat"].values, dem["lon"].values, dem.values.astype(np.float64)
+
+    def cell_index(g, c):                                        # 3 km cell of each GEBCO coordinate, -1 = outside
+        step = np.abs(np.diff(c)).mean()
+        k = np.abs(g[:, None] - c[None, :]).argmin(axis = 1)
+        return np.where(np.abs(g - c[k]) <= step / 2, k, -1)
+
+    iy, ix = cell_index(g_lat, lat), cell_index(g_lon, lon)
+    keep = (iy[:, None] >= 0) & (ix[None, :] >= 0) & (z > 0)    # land GEBCO points inside the 3 km grid
+    flat = (np.broadcast_to(iy[:, None], z.shape) * len(lon) + np.broadcast_to(ix[None, :], z.shape))[keep]
+    total = np.bincount(flat, weights = z[keep], minlength = len(lat) * len(lon))
+    count = np.bincount(flat, minlength = len(lat) * len(lon))
+    out = np.where(count > 0, total / np.maximum(count, 1), 0).reshape(len(lat), len(lon)).astype(np.float32)
+    if land_frac_path is not None:
+        out[~load_land_frac(land_frac_path, lat, lon)] = 0
+    return out                                                   # (H, W)
 
 
 def gcm_cells(lat, lon, gcm_grid_file):
@@ -840,7 +869,8 @@ def load_grid_cached(args):
     # are saved once in --cache-dir on the local disk and reused while the inputs stay the same.
     key = json.dumps({"layout": "gcm-grid-v2", "aladin_dir": str(args.aladin_dir), "scenarios": args.scenarios,
                       "predictors": args.predictors, "target": args.target,
-                      "gcm_grid_file": str(args.gcm_grid_file), "dem_path": str(args.dem_path)}, sort_keys = True)
+                      "gcm_grid_file": str(args.gcm_grid_file), "dem_path": str(args.dem_path),
+                      "land_frac_path": str(args.land_frac_path), "dem": "land-only-v2"}, sort_keys = True)
     cache = Path(args.cache_dir) / f"data_{hashlib.sha1(key.encode()).hexdigest()[:12]}.npz" if args.cache_dir else None
 
     if cache is not None and cache.exists():
@@ -853,7 +883,7 @@ def load_grid_cached(args):
     t0 = time.time()
     coarse, Y, times, lat, lon, grid = load_grid_data(args.aladin_dir, args.scenarios, args.predictors,
                                                       args.target, args.gcm_grid_file)
-    dem = load_dem(args.dem_path, lat, lon)
+    dem = load_dem(args.dem_path, lat, lon, args.land_frac_path)
     print(f"Data read in {time.time() - t0:.0f} s")
     if cache is not None:
         cache.parent.mkdir(parents = True, exist_ok = True)
@@ -1078,7 +1108,7 @@ def train_fold(fold, coarse, season, Y, dem, land_mask, times, lat, lon, grid, a
     # (per variable and per GCM cell; the sin/cos of the day are already in [-1, 1] and are not normalized)
     stats = normalization_stats(coarse[idx_train], Y[idx_train], dem)
     stats.update({"predictors": args.predictors, "target": args.target, "scenarios": args.scenarios,
-                  "dem_path": str(args.dem_path), "base_channels": args.base_channels,
+                  "dem_path": str(args.dem_path), "land_frac_path": str(args.land_frac_path), "base_channels": args.base_channels,
                   "dense_neurons": args.dense_neurons, "dropout": args.dropout,
                   "input_layout": "gcm_grid_2d", "coarse_shape": list(coarse.shape[1:]),
                   "coarse_channels": args.coarse_channels, "seasonal": season is not None,
@@ -1218,6 +1248,8 @@ def resolve_paths(args):
     args.data_dir = data_dir
     args.aladin_dir = Path(args.aladin_dir).expanduser() if args.aladin_dir else data_dir / ALADIN_SUBDIR
     args.dem_path = Path(args.dem_path).expanduser() if args.dem_path else data_dir / DEM_SUBPATH
+    land_frac = getattr(args, "land_frac_path", None)
+    args.land_frac_path = Path(land_frac).expanduser() if land_frac else data_dir / LAND_FRAC_SUBPATH
     args.gcm_grid_file = Path(args.gcm_grid_file).expanduser() if args.gcm_grid_file else data_dir / GCM_GRID_SUBPATH
     if not args.gcm_grid_file.exists():                          # file moved inside the GCM folder? look for it by name
         found = sorted((data_dir / Path(GCM_GRID_SUBPATH).parts[0]).glob(f"**/{args.gcm_grid_file.name}"))
@@ -1228,7 +1260,8 @@ def resolve_paths(args):
     args.cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
 
     missing = [f"{name}: {p}" for name, p in (("data dir", data_dir), ("ALADIN dir", args.aladin_dir),
-                                               ("DEM", args.dem_path), ("GCM grid file", args.gcm_grid_file))
+                                               ("DEM", args.dem_path), ("land fraction", args.land_frac_path),
+                                               ("GCM grid file", args.gcm_grid_file))
                if not p.exists()]
     if missing:
         raise FileNotFoundError("Not found (is the NAS mounted? see --data-dir):\n  " + "\n  ".join(missing))
@@ -1291,6 +1324,7 @@ if __name__ == "__main__":
     paths.add_argument("--data-dir", default = env("UNET_DATA_DIR", DEFAULT_DATA_DIR), help = "NAS data root, e.g. the SSHFS mount point [UNET_DATA_DIR]")
     paths.add_argument("--aladin-dir", default = None, help = f"default: <data-dir>/{ALADIN_SUBDIR}")
     paths.add_argument("--dem-path", default = None, help = f"default: <data-dir>/{DEM_SUBPATH}")
+    paths.add_argument("--land-frac-path", default = None, help = f"fracLand mask, sea DEM -> 0 m; default: <data-dir>/{LAND_FRAC_SUBPATH}")
     paths.add_argument("--gcm-grid-file", default = None, help = f"default: <data-dir>/{GCM_GRID_SUBPATH}")
     paths.add_argument("--models-dir", default = env("UNET_MODELS_DIR", DEFAULT_MODELS_DIR), help = "outputs; prefer a local disk [UNET_MODELS_DIR]")
     paths.add_argument("--cache-dir", default = env("UNET_CACHE_DIR", DEFAULT_CACHE_DIR), help = "local cache of the prepared arrays, '' = off [UNET_CACHE_DIR]")
