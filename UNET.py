@@ -90,7 +90,7 @@ Running on another machine (e.g. a GPU server with the NAS mounted through SSHFS
   Nothing in the code is tied to one machine: paths, device and threads come from flags
   or environment variables (flag > environment variable > default).
 
-    --data-dir      UNET_DATA_DIR    NAS data root (default /mnt/nas/Data)
+    --data-dir      UNET_DATA_DIR    NAS data root (default ~/nas/)
     --models-dir    UNET_MODELS_DIR  outputs (default models/unet_3km, relative to the current folder)
     --cache-dir     UNET_CACHE_DIR   local cache of the prepared arrays (default: off)
     --device        UNET_DEVICE      auto | cuda | cuda:1 | mps | cpu (default auto: GPU if found)
