@@ -6,3 +6,5 @@ xarray>=2024.1
 netCDF4>=1.6
 scipy>=1.11
 pandas>=2.0
+scikit-learn>=1.4    # predictor_analysis.py only
+matplotlib>=3.8      # predictor_analysis.py, analyze_run.py

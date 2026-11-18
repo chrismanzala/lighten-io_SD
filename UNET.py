@@ -9,10 +9,14 @@ to 3 km, using the bias-corrected ALADIN data (ALADIN_CORRIGE) and a DEM.
 
 Inputs / output
 ---------------
-  1D input : each predictor upscaled onto the GCM grid: mean of the 3 km land pixels inside
-             each 1.4 deg cell. The domain overlaps 2 x 2 GCM cells, so 6 variables x 4 cells
-             = 24 numbers per day. Goes through InputBlock1D (dense stack) and is injected
-             at the bottleneck.
+  GCM-grid input (2D, small) : each predictor upscaled onto the CNRM-ESM2-1 grid: mean of the 3 km
+             land pixels inside each 1.4 deg cell. La Reunion is covered by 2 x 2 GCM cells, so the
+             input is a map of 4 variables x 2 rows x 2 cols per day (rows south -> north, cols
+             west -> east). Joined at the bottleneck, where the U-Net map is also 2 x 2.
+  1D input : sin and cos of the day of the year (day 1 ... 365, or 366 in leap years), so the
+             model knows the season; 31 December and 1 January are neighbours. Goes through
+             InputBlock1D (dense stack) and is copied to every bottleneck pixel. --no-seasonal
+             leaves it out.
   2D input : static DEM (GEBCO, averaged onto the 3 km grid, sea = 0 m), one channel.
              Goes through InputBlock2D and the skip connections.
   output   : target variable on the 3 km grid, (N, 1, H, W).
@@ -20,18 +24,30 @@ Inputs / output
 Architecture (default: 32 base channels, 4 blocks)
 --------------------------------------------------
   DEM -> InputBlock2D (32) -> 4 x ContractiveBlock (MaxPool + 2 x Conv3x3-BN-ReLU)
-                                 channels 64 / 128 / 256 / 256, resolution H/2 ... H/16
-  vector -> InputBlock1D -> BottleNeckBlock (conv to 1x1, concat vector, ConvTranspose back)
+                                 channels 64 / 128 / 256 / 256, resolution 32 -> 16 -> 8 -> 4 -> 2
+  CoarseBottleneckBlock at 2 x 2:
+      terrain features                       256 channels
+    + GCM grid (4 x 2 x 2) -> 1x1 conv       128 channels   (--coarse-channels)
+    + sin/cos -> InputBlock1D 2->32->64->128 128 channels, copied to the 4 pixels (--dense-neurons)
+    = 512 channels -> 2 x Conv3x3-BN-ReLU
   -> 4 x ExpansiveBlock (bilinear Upsample x2 -> Conv3x3 -> concat skip -> 2 x Conv3x3)
-  -> OutputBlock (1x1 Conv; optional extra resolution doublings, 0 here)
+                                 channels 256 / 128 / 64 / 32, resolution 4 -> 8 -> 16 -> 32
+  -> OutputBlock (1x1 Conv) -> crop to the 28 x 32 grid
 
   Building blocks (bottom -> top):
     DenseLayer, ConvolutionalLayer, ConvolutionalBlock, ContractiveBlock,
     DoubleResolutionLayer, ConcatChannelsLayer, ExpansiveBlock, BottleNeckBlock,
-    InputBlock2D, InputBlock1D, OutputBlock, UNET.
-  UNET.forward(x_2D, x_1D). Without input_shape_1D it is a plain U-Net.
+    CoarseBottleneckBlock, InputBlock2D, InputBlock1D, OutputBlock, UNET.
+  UNET.forward(x_2D, x_1D, x_coarse). With input_shape_coarse2D the coarse field (and the 1D
+  vector, if any) joins at the bottleneck through CoarseBottleneckBlock; with only
+  input_shape_1D it is the older flat-vector BottleNeckBlock; with neither, a plain U-Net.
   H and W must be multiples of 2**number_of_blocks: DownscalingModel pads the static
   DEM and crops the output back to the 3 km grid.
+
+Older runs (e.g. run1) used one flat vector (variables x 4 cells) instead of the 2D GCM grid.
+build_model() reads normalization_stats.json and rebuilds either layout, and load_data() /
+load_data_cached() still return the flat vector, so gcm_predict.py and predictor_analysis.py
+keep working with those runs.
 
 Training and evaluation
 -----------------------
@@ -52,9 +68,9 @@ Training and evaluation
 Data (under --data-dir, default /mnt/nas/Data)
 ----------------------------------------------
   METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE/{historical,ssp370}/day/{var}/*.nc
-  CMIP_CNRM_ESM21/tas_day_*historical*.nc   (only its lat/lon: the GCM grid)
+  CMIP_CNRM_ESM21/historical/tas_day_*.nc   (only its lat/lon: the GCM grid)
   DEM/gebco_2025_*.nc                       (DEM, variable "elevation")
-  Predictors: tasmin, hursmax, hursmin, prtot, rsds, sfcWind (the *Adjust variables);
+  Predictors: tasmin, hursmax, hursmin, rsds (the *Adjust variables, see PREDICTORS);
   default target: tasmaxAdjust (not among the predictors).
 
 Usage
@@ -359,6 +375,34 @@ class BottleNeckBlock(nn.Sequential):
 
 
 
+class CoarseBottleneckBlock(nn.Module):
+    # Bottleneck for a coarse 2D input, e.g. the GCM cells over the domain (variables x rows x cols).
+    # After the contractive path the U-Net map is small (2 x 2 for a 32 x 32 input), about the size of the
+    # GCM grid over La Reunion (2 x 2 cells), so the coarse field is joined there as extra channels and keeps
+    # the position of each cell. If the two grids differ in size, the coarse field is resized (nearest).
+    # An optional 1D vector (e.g. sin/cos of the day of the year, after InputBlock1D) is copied to every
+    # bottleneck pixel. A ConvolutionalBlock then mixes terrain, GCM and vector channels.
+    def __init__(self, in_channels, bottleneck_hw, coarse_shape, coarse_channels = 128, vector_features = 0,
+                 dropout_rate = 0) -> None:
+        super().__init__()
+        self.bottleneck_hw = tuple(int(v) for v in bottleneck_hw)
+        self.coarse_proj = ConvolutionalLayer(in_channels = coarse_shape[0], out_channels = coarse_channels,
+                                              kernel_size = 1, padding = 0, dropout_rate = dropout_rate)
+        mixed = in_channels + coarse_channels + vector_features
+        self.mix = ConvolutionalBlock(in_channels = mixed, kernel_size = 3, multiplies_channels_by = 1,
+                                      dropout_rate = dropout_rate, padding = 'same', padding_mode = 'replicate')
+        self.out_channels = self.mix.out_channels
+
+    def forward(self, x, x_coarse, x_1D = None):
+        if x_coarse.shape[-2:] != x.shape[-2:]:
+            x_coarse = F.interpolate(x_coarse, size = x.shape[-2:], mode = "nearest")
+        parts = [x, self.coarse_proj(x_coarse)]
+        if x_1D is not None:
+            parts.append(x_1D[:, :, None, None].expand(-1, -1, *x.shape[-2:]))
+        return self.mix(torch.cat(parts, dim = 1))
+
+
+
 class InputBlock2D(nn.Sequential):
     def __init__(self, input_shape, reshaped_input_size = None, kernel_size = 3, number_of_kernels = 64, dropout_rate = 0,
                  padding = 'same', padding_mode = 'zeros') -> None:
@@ -462,6 +506,8 @@ class UNET(nn.Module):
     def __init__(self, 
                  input_shape_2D, output_channels,
                  input_shape_1D = None, 
+                 input_shape_coarse2D = None,
+                 coarse_channels = 128,
                  input_processing_block_2D = None,
                  input_number_kernels = 64,
                  number_of_blocks = 4,
@@ -472,6 +518,8 @@ class UNET(nn.Module):
                  dropout_rate_2D = 0.,
                  debug_sizes = False) -> None:
         # input_size: (N, Variables, Height,, Width)
+        # input_shape_1D       : (N, features) vector joined at the bottleneck (BottleNeckBlock, or CoarseBottleneckBlock)
+        # input_shape_coarse2D : (variables, rows, cols) coarse field joined at the bottleneck (CoarseBottleneckBlock)
         # input_processing_block_2D : a block that processes the input 2D data (e.g., cropping)
         #    it requires an output_shape attribute, same format as input_shape_2D, which is typically e.g., xx2d.shape
         super().__init__()
@@ -488,6 +536,8 @@ class UNET(nn.Module):
             
 
         self.input_shape_1D = input_shape_1D
+        self.input_shape_coarse2D = tuple(input_shape_coarse2D) if input_shape_coarse2D is not None else None
+        adds_at_bottleneck = (input_shape_1D is not None) or (self.input_shape_coarse2D is not None)
         # Fix input-output dimensions using output_padding in deconvolutions:
         self.out_padding_pattern = torch.zeros(number_of_blocks, 2)        
         dimension_tracker = torch.tensor(self.input_shape_2D[2:4])
@@ -520,11 +570,11 @@ class UNET(nn.Module):
         for i in range(number_of_blocks):
             if i == 0:
                 block = ContractiveBlock( in_channels, kernel_size = kernel_size, dropout_rate = dropout_rate_2D, 
-                                         multiplies_channels_by = (2 if self.input_shape_1D == None else 1),
+                                         multiplies_channels_by = (1 if adds_at_bottleneck else 2),
                                          padding_mode = "replicate")                
             if i == (number_of_blocks-1):
                 block = ContractiveBlock( in_channels, kernel_size = kernel_size, dropout_rate = dropout_rate_2D, 
-                                         multiplies_channels_by = (2 if self.input_shape_1D == None else 1) )
+                                         multiplies_channels_by = (1 if adds_at_bottleneck else 2) )
                 #last block is not connected with skip, 
                 # also in orignal model description last block does NOT double number of features, because the bottleneck adds them
                 # here if 1D input is set to None the channels will be multiplied.
@@ -537,7 +587,15 @@ class UNET(nn.Module):
 
 
         
-        if self.input_shape_1D != None:
+        bottleneck_hw = (int(dimension_tracker[0].item()), int(dimension_tracker[1].item()))
+        if self.input_shape_coarse2D is not None:
+            self.bottleneck_block = CoarseBottleneckBlock(
+                in_channels = in_channels, bottleneck_hw = bottleneck_hw, coarse_shape = self.input_shape_coarse2D,
+                coarse_channels = coarse_channels,
+                vector_features = self.input_block1D.out_features if self.input_block1D is not None else 0,
+                dropout_rate = dropout_rate_2D)
+            in_channels = self.bottleneck_block.out_channels
+        elif self.input_shape_1D != None:
             self.bottleneck_block = BottleNeckBlock(dimensions_2D_input = (in_channels, 
                                                                            int(dimension_tracker[0].item()),
                                                                            int(dimension_tracker[1].item())),
@@ -576,7 +634,7 @@ class UNET(nn.Module):
 
 
 
-    def forward(self, x, x_1D = None):  # fixme 1d input
+    def forward(self, x, x_1D = None, x_coarse = None):
         
         #print("input shape: ", x.shape)
         if not (self.input_processing_block_2D is None):
@@ -600,7 +658,9 @@ class UNET(nn.Module):
             x = self.contractivePath[i](x)
             #print("after contractivePath block " + str(i) + " shape: ", x.shape)
 
-        if self.input_block1D != None:
+        if self.input_shape_coarse2D is not None:
+            x = self.bottleneck_block(x, x_coarse, x_1D)
+        elif self.input_block1D != None:
             x = self.bottleneck_block(x = x, input1Dblock_output = x_1D)
             #print("after bottleneck_block shape: ", x.shape)
 
@@ -636,11 +696,10 @@ DEFAULT_DEVICE = "auto"                                                  # --dev
 # Locations inside the data directory (override the full path with --aladin-dir, --dem-path, --gcm-grid-file)
 ALADIN_SUBDIR = "METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE"  # {scenario}/day/{var}/*.nc
 DEM_SUBPATH = "DEM/gebco_2025_n-20.82_s-21.45_w55.15_e55.9.nc"
-GCM_GRID_SUBPATH = "CMIP_CNRM_ESM21/tas_day_CNRM-ESM2-1_historical_r1i1p1f2_gr_18500101-20141231.nc"
+GCM_GRID_SUBPATH = "CMIP_CNRM_ESM21/historical/tas_day_CNRM-ESM2-1_historical_r1i1p1f2_gr_18500101-20141231.nc"
 
 SCENARIOS = ["historical", "ssp370"]
-PREDICTORS = ["tasminAdjust", "hursmaxAdjust", "hursminAdjust",
-              "prtotAdjust", "rsdsAdjust", "sfcWindAdjust"]       # present in both historical and ssp370; target excluded
+PREDICTORS = ["tasminAdjust", "hursmaxAdjust", "hursminAdjust","rsdsAdjust"]       # present in both historical and ssp370; target excluded
 TARGET = "tasmaxAdjust"
 TEST_PERIODS = ["2011-2014", "2046-2050", "2096-2100"]   # fixed test set, the same for every fold
 N_FOLDS = 10                                              # cross-validation folds; each non-test year validates once
@@ -711,59 +770,116 @@ def upscale_to_gcm(values, labels, n_cells):
     return out
 
 
-def load_data(aladin_dir, scenarios, predictors, target, gcm_grid_file):
+def gcm_grid(lat, lon, gcm_grid_file):
+    # The GCM cells covering the domain as a small regular grid, oriented like the 3 km data
+    # (rows follow the data's latitude order, columns its longitude order). Over La Reunion: 2 x 2 cells.
+    labels, centres = gcm_cells(lat, lon, gcm_grid_file)
+    c_lat = np.array([c[0] for c in centres]); c_lon = np.array([c[1] for c in centres])
+    cell_lat, cell_lon = np.unique(c_lat), np.unique(c_lon)
+    if len(centres) != len(cell_lat) * len(cell_lon):
+        raise ValueError(f"The {len(centres)} GCM cells over the domain do not form a rectangle")
+    if lat[0] > lat[-1]:
+        cell_lat = cell_lat[::-1]
+    if (lon[0] % 360) > (lon[-1] % 360):
+        cell_lon = cell_lon[::-1]
+    rows = np.array([np.where(cell_lat == v)[0][0] for v in c_lat])
+    cols = np.array([np.where(cell_lon == v)[0][0] for v in c_lon])
+    return labels, rows, cols, cell_lat, cell_lon
+
+
+def load_grid_data(aladin_dir, scenarios, predictors, target, gcm_grid_file):
+    # Predictors upscaled onto the GCM grid, kept as maps: coarse (T, V, rows, cols), mean of the 3 km land
+    # pixels inside each cell (NaN for a cell without land). Target Y (T, 1, H, W) on the 3 km grid.
     y_da = load_variable_all(aladin_dir, scenarios, target)
     lat, lon = y_da["lat"].values, y_da["lon"].values
-    labels, centres = gcm_cells(lat, lon, gcm_grid_file)
-    first = y_da.values[0].ravel()
-    land_cells = [k for k in range(len(centres)) if np.isfinite(first[labels.ravel() == k]).any()]
+    labels, rows, cols, cell_lat, cell_lon = gcm_grid(lat, lon, gcm_grid_file)
+    gy, gx = len(cell_lat), len(cell_lon)
+    land0 = np.isfinite(y_da.values[0]).ravel()
+    land_pixels = np.zeros((gy, gx), dtype = int)
+    for k in range(len(rows)):
+        land_pixels[rows[k], cols[k]] = int((land0 & (labels.ravel() == k)).sum())
 
     upscaled = []                                                # one variable at a time keeps memory low
     for v in predictors:
         da = load_variable_all(aladin_dir, scenarios, v)
-        up = upscale_to_gcm(da.values.astype(np.float32), labels, len(centres))[:, land_cells]
-        upscaled.append((da["time"].values, up, v))
+        up = upscale_to_gcm(da.values.astype(np.float32), labels, len(rows))      # (T, n_cells)
+        grid_values = np.full((len(up), gy, gx), np.nan, dtype = np.float32)
+        grid_values[:, rows, cols] = up
+        upscaled.append((da["time"].values, grid_values))
 
     times = y_da["time"].values
-    for t, _, _ in upscaled:
+    for t, _ in upscaled:
         times = np.intersect1d(times, t)                         # days present in every variable
-
-    cols, names = [], []
-    for t, up, v in upscaled:
-        cols.append(up[np.searchsorted(t, times)])
-        names += [f"{v}@{centres[k][0]:.2f}N,{centres[k][1]:.2f}E" for k in land_cells]
-    features = np.concatenate(cols, axis = 1).astype(np.float32)                 # (T, V * cells)
-    Y = y_da.sel(time = times).values[:, None].astype(np.float32)               # (T, 1, H, W)
-
+    coarse = np.stack([g[np.searchsorted(t, times)] for t, g in upscaled], axis = 1).astype(np.float32)
+    Y = y_da.sel(time = times).values[:, None].astype(np.float32)
+    grid = {"cell_lat": [float(v) for v in cell_lat], "cell_lon": [float(v) for v in cell_lon],
+            "land_pixels": land_pixels.tolist()}
     print(f"{'+'.join(scenarios)}: {len(times)} days ({str(times[0])[:10]} -> {str(times[-1])[:10]}) | "
-          f"grid {Y.shape[2:]} | GCM cells with land: {len(land_cells)} -> 1D features {features.shape[1]}")
+          f"grid {Y.shape[2:]} | GCM grid {gy} x {gx} cells, land pixels per cell {land_pixels.tolist()}")
+    return coarse, Y, times, lat, lon, grid
+
+
+def flatten_grid(coarse, grid, predictors):
+    # Older 1D layout: one value per variable and per GCM cell with land, cells in row-major order
+    # (e.g. "tasminAdjust@-21.71N,54.84E"), as used by run1, gcm_predict.py and predictor_analysis.py.
+    rr, cc = np.nonzero(np.array(grid["land_pixels"]) > 0)
+    features = coarse[:, :, rr, cc].reshape(len(coarse), -1).astype(np.float32)
+    names = [f"{v}@{grid['cell_lat'][r]:.2f}N,{grid['cell_lon'][c]:.2f}E" for v in predictors for r, c in zip(rr, cc)]
+    return features, names
+
+
+def load_data(aladin_dir, scenarios, predictors, target, gcm_grid_file):
+    # Flat 1D layout (T, V * cells with land); same output as before the 2D GCM input
+    coarse, Y, times, lat, lon, grid = load_grid_data(aladin_dir, scenarios, predictors, target, gcm_grid_file)
+    features, names = flatten_grid(coarse, grid, predictors)
     return features, Y, times, lat, lon, names
 
 
-def load_data_cached(args):
-    # Reading the NetCDF files through SSHFS is slow: the prepared arrays (1D features, target, DEM)
+def load_grid_cached(args):
+    # Reading the NetCDF files through SSHFS is slow: the prepared arrays (GCM-grid predictors, target, DEM)
     # are saved once in --cache-dir on the local disk and reused while the inputs stay the same.
-    key = json.dumps({"aladin_dir": str(args.aladin_dir), "scenarios": args.scenarios, "predictors": args.predictors,
-                      "target": args.target, "gcm_grid_file": str(args.gcm_grid_file), "dem_path": str(args.dem_path)},
-                     sort_keys = True)
+    key = json.dumps({"layout": "gcm-grid-v2", "aladin_dir": str(args.aladin_dir), "scenarios": args.scenarios,
+                      "predictors": args.predictors, "target": args.target,
+                      "gcm_grid_file": str(args.gcm_grid_file), "dem_path": str(args.dem_path)}, sort_keys = True)
     cache = Path(args.cache_dir) / f"data_{hashlib.sha1(key.encode()).hexdigest()[:12]}.npz" if args.cache_dir else None
 
     if cache is not None and cache.exists():
         d = np.load(cache, allow_pickle = False)
         print(f"Loaded cached data: {cache}")
-        return (d["features"], d["Y"], d["times"], d["lat"], d["lon"], d["names"].tolist(), d["dem"])
+        grid = {"cell_lat": d["cell_lat"].tolist(), "cell_lon": d["cell_lon"].tolist(),
+                "land_pixels": d["land_pixels"].tolist()}
+        return d["coarse"], d["Y"], d["times"], d["lat"], d["lon"], grid, d["dem"]
 
     t0 = time.time()
-    features, Y, times, lat, lon, names = load_data(args.aladin_dir, args.scenarios, args.predictors,
-                                                    args.target, args.gcm_grid_file)
+    coarse, Y, times, lat, lon, grid = load_grid_data(args.aladin_dir, args.scenarios, args.predictors,
+                                                      args.target, args.gcm_grid_file)
     dem = load_dem(args.dem_path, lat, lon)
     print(f"Data read in {time.time() - t0:.0f} s")
     if cache is not None:
         cache.parent.mkdir(parents = True, exist_ok = True)
-        np.savez(cache, features = features, Y = Y, times = times, lat = lat, lon = lon,
-                 names = np.array(names), dem = dem, key = np.array(key))
+        np.savez(cache, coarse = coarse, Y = Y, times = times, lat = lat, lon = lon, dem = dem,
+                 cell_lat = np.array(grid["cell_lat"]), cell_lon = np.array(grid["cell_lon"]),
+                 land_pixels = np.array(grid["land_pixels"]), key = np.array(key))
         print(f"Saved cache: {cache}")
+    return coarse, Y, times, lat, lon, grid, dem
+
+
+def load_data_cached(args):
+    # Flat 1D layout, same output as before: (features, Y, times, lat, lon, names, dem)
+    coarse, Y, times, lat, lon, grid, dem = load_grid_cached(args)
+    features, names = flatten_grid(coarse, grid, args.predictors)
     return features, Y, times, lat, lon, names, dem
+
+
+def seasonal_features(times):
+    # sin and cos of the day of the year, day 1 ... 365 (366 in leap years): one full cycle per year,
+    # 31 December and 1 January end up next to each other. (T, 2), already in [-1, 1].
+    t = times.astype("datetime64[D]")
+    years = t.astype("datetime64[Y]").astype(int) + 1970
+    doy = (t - t.astype("datetime64[Y]")).astype(int) + 1
+    n_days = np.where((years % 4 == 0) & ((years % 100 != 0) | (years % 400 == 0)), 366, 365)
+    angle = 2 * np.pi * doy / n_days
+    return np.stack([np.sin(angle), np.cos(angle)], axis = 1).astype(np.float32)
 
 
 def parse_periods(specs):
@@ -865,9 +981,13 @@ def pad_to_multiple(x, multiple):
 
 
 class DownscalingModel(nn.Module):
-    # Wraps the UNET. The DEM is stored as a buffer (it is the same for every day) and fed as the 2D input,
-    # the coarse predictor vector is the 1D input injected at the bottleneck. Output: (N, 1, H, W) on the 3 km grid.
-    def __init__(self, static, n_features, number_of_blocks = 4, neurons = (64, 128, 256), **unet_kwargs) -> None:
+    # Wraps the UNET. The DEM is stored as a buffer (it is the same for every day) and fed as the 2D input.
+    #   coarse_shape given : the GCM-grid predictors (variables x rows x cols) are a 2D input joined at the
+    #                        bottleneck; n_features = length of the optional 1D vector (sin/cos of the day), 0 = none
+    #   coarse_shape None  : older layout (e.g. run1): one flat 1D vector of n_features joined at the bottleneck
+    # Output: (N, 1, H, W) on the 3 km grid.
+    def __init__(self, static, n_features, number_of_blocks = 4, neurons = (64, 128, 256),
+                 coarse_shape = None, coarse_channels = 128, **unet_kwargs) -> None:
         super().__init__()
 
         self.multiple = 2 ** number_of_blocks
@@ -875,15 +995,18 @@ class DownscalingModel(nn.Module):
         static, self.hr_shape = pad_to_multiple(static, self.multiple)
         self.register_buffer("static", static)
 
-        self.unet = UNET(input_shape_2D = (1, *static.shape[1:]), input_shape_1D = (1, n_features),
+        self.unet = UNET(input_shape_2D = (1, *static.shape[1:]),
+                         input_shape_1D = (1, n_features) if n_features else None,
+                         input_shape_coarse2D = coarse_shape, coarse_channels = coarse_channels,
                          output_channels = 1, number_of_blocks = number_of_blocks,
                          inputNN_neurons_list = list(neurons), double_resolution_times = 0,
                          **unet_kwargs)
 
-    def forward(self, x_1D):
+    def forward(self, x_1D = None, x_coarse = None):
         h, w = self.hr_shape
-        x_2D = self.static.expand(x_1D.shape[0], -1, -1, -1)
-        return self.unet(x_2D, x_1D)[..., :h, :w]
+        n = (x_coarse if x_coarse is not None else x_1D).shape[0]
+        x_2D = self.static.expand(n, -1, -1, -1)
+        return self.unet(x_2D, x_1D, x_coarse)[..., :h, :w]
 
 
 def masked_mse(y_pred, y_true):
@@ -891,26 +1014,26 @@ def masked_mse(y_pred, y_true):
     return ((y_pred[mask] - y_true[mask]) ** 2).mean()
 
 
-def batches(f, y, idx, batch_size, shuffle = False):
+def batches(inputs, y, idx, batch_size, shuffle = False):
     # Mini-batches drawn from tensors that already sit on the device (the whole dataset fits in GPU memory),
     # which avoids a DataLoader copying every batch from the CPU. Training drops the last incomplete batch:
-    # BatchNorm1d needs more than one sample.
-    idx = torch.as_tensor(idx, device = f.device)
+    # BatchNorm1d needs more than one sample. inputs: dict of model inputs, e.g. {"x_coarse": ..., "x_1D": ...}.
+    idx = torch.as_tensor(idx, device = y.device)
     if shuffle:
-        idx = idx[torch.randperm(len(idx), device = f.device)]
+        idx = idx[torch.randperm(len(idx), device = y.device)]
     stop = len(idx) - (len(idx) % batch_size) if shuffle else len(idx)
     for i in range(0, stop, batch_size):
         b = idx[i:i + batch_size]
-        yield f[b], y[b]
+        yield {k: t[b] for k, t in inputs.items()}, y[b]
 
 
 def run_epoch(model, batch_iter, optimizer = None, amp_dtype = None, scaler = None):
     model.train(optimizer is not None)
     total, n = 0.0, 0
     with torch.set_grad_enabled(optimizer is not None):
-        for x, y in batch_iter:
-            with torch.autocast(device_type = x.device.type, dtype = amp_dtype, enabled = amp_dtype is not None):
-                y_pred = model(x)
+        for inputs, y in batch_iter:
+            with torch.autocast(device_type = y.device.type, dtype = amp_dtype, enabled = amp_dtype is not None):
+                y_pred = model(**inputs)
             loss = masked_mse(y_pred.float(), y)
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none = True)
@@ -921,21 +1044,26 @@ def run_epoch(model, batch_iter, optimizer = None, amp_dtype = None, scaler = No
                 else:
                     loss.backward()
                     optimizer.step()
-            total += loss.item() * x.shape[0]
-            n += x.shape[0]
+            total += loss.item() * y.shape[0]
+            n += y.shape[0]
     return total / n
 
 
 def build_model(stats, n_features, dem, device):
+    # Rebuilds the network described by a fold's normalization_stats.json.
+    # Runs with "coarse_shape" use the 2D GCM-grid input (+ optional sin/cos vector); older runs (no
+    # "coarse_shape", e.g. run1) use one flat vector of n_features, as before.
     static = ((dem - stats["dem_mean"]) / (stats["dem_std"] + 1e-8))[None]      # (1, H, W): one static channel
-    return DownscalingModel(static = static, n_features = n_features,
-                            neurons = stats["dense_neurons"],
-                            input_number_kernels = stats["base_channels"],
-                            dropout_rate_2D = stats["dropout"],
-                            dropout_rate_1Dinput = stats["dropout"]).to(device)
+    common = dict(neurons = stats["dense_neurons"], input_number_kernels = stats["base_channels"],
+                  dropout_rate_2D = stats["dropout"], dropout_rate_1Dinput = stats["dropout"])
+    if stats.get("coarse_shape") is None:
+        return DownscalingModel(static = static, n_features = n_features, **common).to(device)
+    return DownscalingModel(static = static, n_features = stats.get("n_features", 0),
+                            coarse_shape = stats["coarse_shape"], coarse_channels = stats["coarse_channels"],
+                            **common).to(device)
 
 
-def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, device):
+def train_fold(fold, coarse, season, Y, dem, land_mask, times, lat, lon, grid, args, device):
     import xarray as xr
 
     val_label, k = blocks_label(fold["val_blocks"]), fold["fold"]
@@ -947,19 +1075,24 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
     seed_everything(args.seed + k)
 
     # Statistics from this fold's training days only
-    stats = normalization_stats(features[idx_train], Y[idx_train], dem)
+    # (per variable and per GCM cell; the sin/cos of the day are already in [-1, 1] and are not normalized)
+    stats = normalization_stats(coarse[idx_train], Y[idx_train], dem)
     stats.update({"predictors": args.predictors, "target": args.target, "scenarios": args.scenarios,
                   "dem_path": str(args.dem_path), "base_channels": args.base_channels,
                   "dense_neurons": args.dense_neurons, "dropout": args.dropout,
-                  "n_features": features.shape[1], "feature_names": names, "fold": k,
+                  "input_layout": "gcm_grid_2d", "coarse_shape": list(coarse.shape[1:]),
+                  "coarse_channels": args.coarse_channels, "seasonal": season is not None,
+                  "n_features": season.shape[1] if season is not None else 0, "gcm_grid": grid, "fold": k,
                   "val_blocks": blocks_label(fold["val_blocks"]), "test_periods": [f"{a}-{b}" for a, b in args.test_periods]})
     json.dump(stats, open(out_dir / "normalization_stats.json", "w"), indent = 2)
 
     # Whole normalized dataset on the device once (about 160 MB)
-    f_t = torch.from_numpy(normalize_features(features, stats)).to(device)
+    inputs = {"x_coarse": torch.from_numpy(normalize_features(coarse, stats)).to(device)}   # (T, V, rows, cols)
+    if season is not None:
+        inputs["x_1D"] = torch.from_numpy(season).to(device)                                # (T, 2) sin, cos
     y_t = torch.from_numpy((Y - stats["y_mean"]) / (stats["y_std"] + 1e-8)).to(device)   # NaN (sea) kept, masked in the loss
 
-    model = build_model(stats, features.shape[1], dem, device)
+    model = build_model(stats, stats["n_features"], dem, device)
     optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor = 0.5, patience = 7)
     amp_dtype, scaler = amp_settings(args.amp, device)
@@ -967,9 +1100,9 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
     best_val, epochs_without_improvement = float("inf"), 0
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_loss = run_epoch(model, batches(f_t, y_t, idx_train, args.batch_size, shuffle = True),
+        train_loss = run_epoch(model, batches(inputs, y_t, idx_train, args.batch_size, shuffle = True),
                                optimizer, amp_dtype, scaler)
-        val_loss = run_epoch(model, batches(f_t, y_t, idx_val, args.eval_batch_size), amp_dtype = amp_dtype)
+        val_loss = run_epoch(model, batches(inputs, y_t, idx_val, args.eval_batch_size), amp_dtype = amp_dtype)
         scheduler.step(val_loss)
         print(f"Fold {k} | epoch {epoch:3d} | train MSE {train_loss:.4f} | val MSE {val_loss:.4f} | {time.time() - t0:.0f} s")
 
@@ -987,8 +1120,8 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
     model.eval()
     preds = []
     with torch.no_grad():
-        for x, _ in batches(f_t, y_t, idx_test, args.eval_batch_size):
-            preds.append(model(x).float().cpu().numpy())
+        for x, _ in batches(inputs, y_t, idx_test, args.eval_batch_size):
+            preds.append(model(**x).float().cpu().numpy())
     pred = np.concatenate(preds)[:, 0] * stats["y_std"] + stats["y_mean"]
     pred = np.where(land_mask[None], pred, np.nan).astype(np.float32)
 
@@ -1002,7 +1135,7 @@ def train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, 
     print(f"Fold {k} | test set: RMSE {metrics['rmse_all']:.3f} | MAE {metrics['mae_all']:.3f} | "
           f"bias {metrics['bias_all']:+.3f} | " +
           " | ".join(f"{a}-{b} RMSE {metrics[f'rmse_{a}-{b}']:.3f}" for a, b in args.test_periods))
-    del f_t, y_t
+    del inputs, y_t
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return metrics
@@ -1086,6 +1219,11 @@ def resolve_paths(args):
     args.aladin_dir = Path(args.aladin_dir).expanduser() if args.aladin_dir else data_dir / ALADIN_SUBDIR
     args.dem_path = Path(args.dem_path).expanduser() if args.dem_path else data_dir / DEM_SUBPATH
     args.gcm_grid_file = Path(args.gcm_grid_file).expanduser() if args.gcm_grid_file else data_dir / GCM_GRID_SUBPATH
+    if not args.gcm_grid_file.exists():                          # file moved inside the GCM folder? look for it by name
+        found = sorted((data_dir / Path(GCM_GRID_SUBPATH).parts[0]).glob(f"**/{args.gcm_grid_file.name}"))
+        if found:
+            print(f"GCM grid file not at {args.gcm_grid_file}, using {found[0]}")
+            args.gcm_grid_file = found[0]
     args.models_dir = Path(args.models_dir).expanduser()
     args.cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
 
@@ -1117,10 +1255,13 @@ def train(args):
                    "started": time.strftime("%Y-%m-%d %H:%M:%S")})
     json.dump(config, open(args.models_dir / "run_config.json", "w"), indent = 2)
 
-    features, Y, times, lat, lon, names, dem = load_data_cached(args)
+    coarse, Y, times, lat, lon, grid, dem = load_grid_cached(args)
+    season = seasonal_features(times) if args.seasonal else None
     land_mask = ~np.isnan(Y[0, 0])
     np.save(args.models_dir / "land_mask.npy", land_mask)
     print(f"DEM {dem.shape}: {dem.min():.0f}-{dem.max():.0f} m | land pixels: {land_mask.sum()}/{land_mask.size}")
+    print(f"Inputs: GCM grid {coarse.shape[1]} variables x {coarse.shape[2]} x {coarse.shape[3]} cells (2D, at the bottleneck)"
+          f" | sin/cos day of year: {'on' if season is not None else 'off'}")
 
     args.test_periods = parse_periods(args.test_periods)
     folds = time_folds(times, args.test_periods, args.n_folds, args.projection_start)
@@ -1135,7 +1276,7 @@ def train(args):
     selected = folds if args.folds is None else [folds[k] for k in args.folds]
 
     for fold in selected:
-        train_fold(fold, features, Y, dem, land_mask, times, lat, lon, names, args, device)
+        train_fold(fold, coarse, season, Y, dem, land_mask, times, lat, lon, grid, args, device)
     test = folds[0]["test"]
     write_cv_summary(args.models_dir, args.target, Y[test, 0], times[test], args.test_periods)
 
@@ -1175,7 +1316,12 @@ if __name__ == "__main__":
 
     model = parser.add_argument_group("model and training")
     model.add_argument("--base-channels", type = int, default = 32)
-    model.add_argument("--dense-neurons", type = int, nargs = "+", default = [64, 128, 256], help = "InputBlock1D layers")
+    model.add_argument("--dense-neurons", type = int, nargs = "+", default = [32, 64, 128],
+                       help = "InputBlock1D layers for the sin/cos of the day")
+    model.add_argument("--coarse-channels", type = int, default = 128,
+                       help = "channels the GCM-grid predictors are projected to at the bottleneck")
+    model.add_argument("--no-seasonal", dest = "seasonal", action = "store_false",
+                       help = "leave out the sin/cos of the day of the year")
     model.add_argument("--dropout", type = float, default = 0.)
     model.add_argument("--batch-size", type = int, default = 16)
     model.add_argument("--eval-batch-size", type = int, default = 256)
