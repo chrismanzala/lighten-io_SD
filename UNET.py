@@ -66,14 +66,16 @@ Training and evaluation
   scored too. Normalization statistics come from the fold's training days only.
   Loss: masked MSE on land pixels.
 
-Data (under --data-dir, default /mnt/nas/Data)
+Data (under --data-dir, default ~/nas/)
 ----------------------------------------------
   METEO_FRANCE/DONNEES_SIMULATIONS/ALADIN/ALADIN_CORRIGE/{historical,ssp370}/day/{var}/*.nc
   CMIP_CNRM_ESM21/historical/tas_day_*.nc   (only its lat/lon: the GCM grid)
   DEM/gebco_2025_*.nc                       (DEM, variable "elevation"; negative over the sea)
   DEM/fracLand_REUNION.nc                   (land mask, variable "fracLand": 0 sea, 1 land)
   Predictors: tasmin, hursmax, hursmin, rsds (the *Adjust variables, see PREDICTORS);
-  default target: tasmaxAdjust (not among the predictors).
+  default target: tasmaxAdjust. With --target, the target is removed from the predictors automatically
+  (e.g. --target tasminAdjust drops tasminAdjust from the default list); --keep-target-predictor
+  keeps it anyway (leakage: the upscaled target is then in the input, scores are optimistic).
 
 Usage
 -----
@@ -691,7 +693,7 @@ class UNET(nn.Module):
 # Paths and machine settings. Each one can be set by a command-line flag or an environment variable,
 # so the same file runs on the NAS host, on a remote GPU machine with the NAS mounted through SSHFS, etc.
 #   priority: command-line flag > environment variable > default below
-DEFAULT_DATA_DIR = "/mnt/nas/Data"                                       # --data-dir    | UNET_DATA_DIR
+DEFAULT_DATA_DIR = "~/nas/"                                       # --data-dir    | UNET_DATA_DIR
 DEFAULT_MODELS_DIR = "models/unet_3km"                                   # --models-dir  | UNET_MODELS_DIR
 DEFAULT_CACHE_DIR = ""                                                   # --cache-dir   | UNET_CACHE_DIR ("" = no cache)
 DEFAULT_DEVICE = "auto"                                                  # --device      | UNET_DEVICE
@@ -1268,8 +1270,24 @@ def resolve_paths(args):
     return args
 
 
+def drop_target_from_predictors(predictors, target):
+    # The target is never its own predictor (it would leak the answer into the input).
+    kept = [v for v in predictors if v != target]
+    if len(kept) < len(predictors):
+        print(f"Target {target} removed from the predictors -> {', '.join(kept)}")
+    if not kept:
+        raise ValueError(f"No predictor left once the target {target} is removed: pass --predictors")
+    return kept
+
+
 def train(args):
     args = resolve_paths(args)
+    if args.keep_target_predictor:
+        if args.target in args.predictors:
+            print(f"WARNING: target {args.target} kept among the predictors (--keep-target-predictor): "
+                  "the input contains the answer at GCM scale, so scores will be optimistic")
+    else:
+        args.predictors = drop_target_from_predictors(args.predictors, args.target)
     if args.seed < 0:                                            # fresh random seed for this run, recorded in run_config.json
         args.seed = int.from_bytes(os.urandom(4), "little") % 2**31
     device = get_device(args.device)
@@ -1345,8 +1363,10 @@ if __name__ == "__main__":
     exp.add_argument("--projection-start", type = int, default = PROJECTION_START,
                      help = "first projection year; each validation set takes years before and after it")
     exp.add_argument("--folds", type = int, nargs = "+", default = None, help = "fold indices to run (default: all)")
-    exp.add_argument("--predictors", nargs = "+", default = PREDICTORS)
+    exp.add_argument("--predictors", nargs = "+", default = PREDICTORS, help = "the target is removed from this list if present")
     exp.add_argument("--target", default = TARGET)
+    exp.add_argument("--keep-target-predictor", action = "store_true",
+                     help = "keep the target among the predictors if listed (leakage: optimistic scores)")
 
     model = parser.add_argument_group("model and training")
     model.add_argument("--base-channels", type = int, default = 32)
