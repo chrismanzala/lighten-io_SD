@@ -43,7 +43,9 @@ Usage
   python predictor_analysis.py --target tasminAdjust
   python predictor_analysis.py --target prtotAdjust --predictors tasminAdjust tasmaxAdjust rsdsAdjust hursminAdjust
   python predictor_analysis.py --cache-dir ~/unet_cache         # reuse / fill UNET.py's cache of prepared arrays
-  python predictor_analysis.py --npz ~/unet_cache/data_xxx.npz  # read a UNET.py cache file directly (no NAS)
+  python predictor_analysis.py --npz ~/unet_cache/data_xxx.npz  # read a UNET.py cache file directly (no NAS);
+                                                                # its variables and target come from the cache,
+                                                                # --predictors picks a subset of them
   python predictor_analysis.py --fast                           # skip the gradient-boosting part (slowest)
 
 Paths follow UNET.py (flag > environment variable > default): --data-dir / UNET_DATA_DIR, --cache-dir /
@@ -51,6 +53,7 @@ UNET_CACHE_DIR, ... Extra dependencies compared with UNET.py: scikit-learn, matp
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -91,11 +94,33 @@ def available_variables(aladin_dir, scenarios):
     return sorted(set.intersection(*sets))
 
 
+def from_grid_cache(d, args):
+    # UNET.py cache with the 2D GCM-grid layout (coarse (T, V, rows, cols)): the variables and the target are
+    # read from the cache key, then flattened to the 1D vector (one column per variable and GCM cell with land)
+    key = json.loads(str(d["key"]))
+    cached, target = key["predictors"], key["target"]
+    if args.target != target:
+        raise SystemExit(f"--npz holds target {target}, not {args.target}: pass --target {target} or use another cache file")
+    wanted = args.predictors or cached
+    missing = [v for v in wanted if v not in cached]
+    if missing:
+        raise SystemExit(f"--npz has no {', '.join(missing)} (it holds {', '.join(cached)})")
+    wanted = [v for v in wanted if v != target]                       # the target is never its own predictor
+    coarse = d["coarse"][:, [cached.index(v) for v in wanted]]
+    grid = {"cell_lat": d["cell_lat"].tolist(), "cell_lon": d["cell_lon"].tolist(),
+            "land_pixels": d["land_pixels"].tolist()}
+    features, names = UNET.flatten_grid(coarse, grid, wanted)
+    print(f"Target {target} | predictors from the cache: {', '.join(wanted)}")
+    return features, d["Y"], d["times"], d["lat"], d["lon"], names, d["dem"]
+
+
 def load(args):
     if args.npz:
         d = np.load(Path(args.npz).expanduser(), allow_pickle = False)
         print(f"Loaded {args.npz}")
-        return d["features"], d["Y"], d["times"], d["lat"], d["lon"], d["names"].tolist(), d["dem"]
+        if "features" in d.files:                                    # old flat cache
+            return d["features"], d["Y"], d["times"], d["lat"], d["lon"], d["names"].tolist(), d["dem"]
+        return from_grid_cache(d, args)
 
     data_dir = Path(args.data_dir).expanduser()
     aladin_dir = Path(args.aladin_dir).expanduser() if args.aladin_dir else data_dir / UNET.ALADIN_SUBDIR
