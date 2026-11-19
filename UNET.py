@@ -111,6 +111,8 @@ Running on another machine (e.g. a GPU server with the NAS mounted through SSHFS
     - On GPU the whole normalized dataset is moved to GPU memory once (~160 MB).
     - --amp uses mixed precision (bfloat16 when the GPU supports it) for faster training.
     - run_config.json in --models-dir records the options, host, torch version and device used.
+    - each fold folder has history.csv: train and validation MSE (normalized units), learning rate
+      and time per epoch, for the learning curves (outputs/plot_loss_curves.py).
 
 Known limitations
 -----------------
@@ -1130,15 +1132,21 @@ def train_fold(fold, coarse, season, Y, dem, land_mask, times, lat, lon, grid, a
     amp_dtype, scaler = amp_settings(args.amp, device)
 
     best_val, epochs_without_improvement = float("inf"), 0
+    history_file = out_dir / "history.csv"                      # one line per epoch: learning and validation curves
+    history_file.write_text("epoch,train_mse,val_mse,lr,seconds,best\n")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         train_loss = run_epoch(model, batches(inputs, y_t, idx_train, args.batch_size, shuffle = True),
                                optimizer, amp_dtype, scaler)
         val_loss = run_epoch(model, batches(inputs, y_t, idx_val, args.eval_batch_size), amp_dtype = amp_dtype)
         scheduler.step(val_loss)
-        print(f"Fold {k} | epoch {epoch:3d} | train MSE {train_loss:.4f} | val MSE {val_loss:.4f} | {time.time() - t0:.0f} s")
+        seconds = time.time() - t0
+        print(f"Fold {k} | epoch {epoch:3d} | train MSE {train_loss:.4f} | val MSE {val_loss:.4f} | {seconds:.0f} s")
 
-        if val_loss < best_val:
+        improved = val_loss < best_val
+        with open(history_file, "a") as f:
+            f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{optimizer.param_groups[0]['lr']:.3g},{seconds:.1f},{int(improved)}\n")
+        if improved:
             best_val, epochs_without_improvement = val_loss, 0
             torch.save(model.state_dict(), out_dir / "best.pt")
         else:
